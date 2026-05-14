@@ -1,24 +1,61 @@
-# Tênis Linhares — Torneios com Supabase
+# Tênis Linhares — Torneios V3: Importação Inteligente
 
-App teste separado para validar o módulo de torneios antes de integrar no site oficial.
+Versão de teste separada do app oficial.
 
-## Funções
+## Novidades da V3
 
-- Criar torneio
-- Criar categorias
-- Cadastrar atletas
-- Permitir mesmo atleta em mais de uma categoria
-- Marcar atleta de Linhares ou de fora
-- Gerar chave por sorteio automático
-- Montar chave manual
-- Gerar programação automática
-- 3 quadras por horário
-- Jogos de 1h30
-- Segunda a quinta: 16:00, 17:30, 19:00, 20:30
-- Sexta: 15:30, 17:00, 18:30, 20:00, 21:30
-- Lançar resultado
-- Vencedor avança automaticamente
-- Área pública com programação, chaves e inscritos
+### Lista única com categorias misturadas
+Agora você pode colar ou subir uma lista única com tudo misturado, e o app tenta separar sozinho:
+
+```text
+3ª Classe Masculina
+João Silva
+Pedro Santos
+
+4ª Classe Masculina
+Carlos Oliveira
+Marcos Lima
+
+2ª Classe Feminina: Maria Souza, Ana Paula
+```
+
+Também aceita:
+
+```text
+João Silva - 3ª Classe Masculina
+Pedro Santos - 3ª Classe Masculina
+Maria Souza - 2ª Classe Feminina
+```
+
+### Importar chave pronta por PDF/TXT/CSV
+Na área de Chaves, você pode subir um PDF, TXT ou CSV.
+
+Se o arquivo tiver confrontos:
+
+```text
+João Silva x Pedro Santos
+Carlos Oliveira x BYE
+```
+
+O app gera a chave real.
+
+Se o arquivo tiver só nomes em ordem, o app reorganiza:
+
+```text
+João Silva
+Pedro Santos
+Carlos Oliveira
+Marcos Lima
+```
+
+E transforma em:
+
+```text
+João Silva x Pedro Santos
+Carlos Oliveira x Marcos Lima
+```
+
+Depois disso a programação automática já consegue usar os jogos.
 
 ## Render
 
@@ -33,21 +70,3 @@ Start Command:
 ```bash
 streamlit run app.py --server.port=$PORT --server.address=0.0.0.0
 ```
-
-## Variáveis no Render
-
-```env
-SUPABASE_URL=https://SEU-PROJETO.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=SUA_SERVICE_ROLE_KEY
-ADMIN_PASSWORD=sua_senha
-```
-
-## Supabase
-
-Antes de rodar o app, execute o arquivo:
-
-```text
-supabase_schema.sql
-```
-
-no SQL Editor do Supabase.

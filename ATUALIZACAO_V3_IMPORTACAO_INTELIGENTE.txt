@@ -1,0 +1,31 @@
+ATUALIZAÇÃO V3 — IMPORTAÇÃO INTELIGENTE
+======================================
+
+Substitua no GitHub:
+
+- app.py
+- requirements.txt
+- README.md
+
+O Supabase é o mesmo da versão anterior. Não precisa alterar banco se você já rodou o SQL.
+
+Depois, no Render:
+
+1. Manual Deploy
+2. Clear build cache & deploy
+
+O que testar:
+
+1. Admin > Atletas
+   - Use "Importação inteligente: lista única com categorias misturadas"
+   - Cole uma lista completa com várias categorias e nomes.
+   - O app deve separar categoria por categoria.
+
+2. Admin > Chaves
+   - Escolha uma categoria.
+   - Use "Importar chave pronta de fora".
+   - Suba PDF/TXT/CSV ou cole confrontos.
+   - O app deve transformar a chave em jogos reais.
+
+3. Admin > Programação
+   - Depois da chave importada, clique em gerar programação automática.

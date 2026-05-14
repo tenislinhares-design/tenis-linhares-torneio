@@ -4,6 +4,7 @@ import random
 import re
 import io
 import csv
+import unicodedata
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -308,6 +309,273 @@ def extract_names_from_free_text(text):
             unique.append(name)
 
     return unique
+
+
+def canonical_text(text):
+    text = str(text or "").strip().lower()
+    text = text.replace("ª", "a").replace("º", "o")
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def category_aliases(category_name):
+    c = canonical_text(category_name)
+    aliases = {c}
+
+    # Atalhos comuns.
+    replacements = [
+        ("classe", ""),
+        ("masculina", "masc"),
+        ("masculino", "masc"),
+        ("feminina", "fem"),
+        ("feminino", "fem"),
+    ]
+
+    short = c
+    for old, new in replacements:
+        short = short.replace(old, new)
+    short = re.sub(r"\s+", " ", short).strip()
+    aliases.add(short)
+
+    # 1ª Classe Masculina -> 1 masculina, 1 classe, 1 masc, 1a masculina
+    m = re.search(r"(\d+)", c)
+    if m:
+        n = m.group(1)
+        aliases.update({
+            f"{n} classe masculina",
+            f"{n}a classe masculina",
+            f"{n} masculino",
+            f"{n} mascul",
+            f"{n} masc",
+            f"{n} classe",
+            f"{n}a classe",
+            f"{n} classe feminina",
+            f"{n}a classe feminina",
+            f"{n} feminino",
+            f"{n} fem",
+        })
+
+    if "iniciante" in c or "iniciantes" in c:
+        aliases.update({"iniciante", "iniciantes", "inic"})
+    if "dupla" in c:
+        aliases.update({"dupla", "duplas"})
+
+    return {a.strip() for a in aliases if a.strip()}
+
+
+def build_category_matcher(tournament_id):
+    cats = get_categories(tournament_id)
+    items = []
+    for cat in cats:
+        for alias in category_aliases(cat["name"]):
+            items.append((alias, cat["id"], cat["name"]))
+    # mais longo primeiro evita confundir "1 classe" antes de "1 classe masculina"
+    items.sort(key=lambda x: len(x[0]), reverse=True)
+    return items
+
+
+def find_category_in_text(text, tournament_id):
+    can = canonical_text(text)
+    if not can:
+        return None
+
+    for alias, cid, cname in build_category_matcher(tournament_id):
+        pattern = r"(^|\s)" + re.escape(alias) + r"($|\s)"
+        if re.search(pattern, can):
+            return {"id": cid, "name": cname, "alias": alias}
+    return None
+
+
+def looks_like_category_header(text):
+    can = canonical_text(text)
+    words = ["classe", "iniciante", "iniciantes", "dupla", "duplas", "feminina", "feminino", "masculina", "masculino"]
+    return any(w in can for w in words) and len(can.split()) <= 6
+
+
+def get_or_create_category_by_name(tournament_id, name):
+    clean = str(name or "").strip()
+    if not clean:
+        return None
+
+    # tenta encontrar categoria existente por nome parecido
+    found = find_category_in_text(clean, tournament_id)
+    if found:
+        return found["id"], found["name"]
+
+    created = insert_row(
+        T_CATEGORIES,
+        {
+            "tournament_id": tournament_id,
+            "name": clean,
+            "max_players": 16,
+        },
+    )
+    if created:
+        return created["id"], created["name"]
+    return None
+
+
+def split_possible_names(text):
+    # Quebra lista do tipo "João, Pedro; Carlos" sem destruir nome composto simples.
+    parts = re.split(r"\s*[,;]\s*", str(text or "").strip())
+    cleaned = []
+    for part in parts:
+        name = clean_imported_name(part)
+        if name and name.upper() != "BYE":
+            cleaned.append(name)
+    return cleaned
+
+
+def extract_names_from_line_without_category(line, category_info=None):
+    text = str(line or "").strip()
+    if category_info:
+        # Remove a categoria do texto e deixa só o nome.
+        text = re.sub(re.escape(category_info["name"]), "", text, flags=re.I).strip(" -–—|:;\t")
+        text = re.sub(re.escape(category_info["alias"]), "", text, flags=re.I).strip(" -–—|:;\t")
+    return split_possible_names(text) or [clean_imported_name(text)]
+
+
+def parse_mixed_category_list(text, tournament_id, fallback_category_id=None, create_missing_categories=False):
+    """
+    Entende listas misturadas:
+    3ª Classe Masculina
+    João
+    Pedro
+
+    4ª Classe Masculina: Carlos, Marcos
+
+    Maria - 2ª Classe Feminina
+    5ª Classe Masculina - André
+    """
+    rows = []
+    warnings = []
+    current_category = None
+
+    raw_text = str(text or "").replace("\r", "\n")
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+
+    # CSV com coluna nome/categoria
+    try:
+        reader = csv.DictReader(io.StringIO(raw_text))
+        if reader.fieldnames:
+            name_field = None
+            cat_field = None
+            for f in reader.fieldnames:
+                fcan = canonical_text(f)
+                if fcan in ["nome", "name", "atleta", "jogador", "player"]:
+                    name_field = f
+                if fcan in ["categoria", "category", "classe"]:
+                    cat_field = f
+            if name_field and cat_field:
+                for row in reader:
+                    name = clean_imported_name(row.get(name_field, ""))
+                    cat_raw = row.get(cat_field, "")
+                    cat_info = find_category_in_text(cat_raw, tournament_id)
+                    if not cat_info and create_missing_categories and looks_like_category_header(cat_raw):
+                        created = get_or_create_category_by_name(tournament_id, cat_raw)
+                        if created:
+                            cat_info = {"id": created[0], "name": created[1], "alias": canonical_text(created[1])}
+                    if name and cat_info:
+                        rows.append({"category_id": cat_info["id"], "category": cat_info["name"], "name": name})
+                    elif name and fallback_category_id:
+                        fallback = get_category(fallback_category_id)
+                        rows.append({"category_id": fallback_category_id, "category": fallback["name"], "name": name})
+                    elif name:
+                        warnings.append(f"Categoria não identificada para: {name}")
+                return rows, warnings
+    except Exception:
+        pass
+
+    for line in lines:
+        original = line
+        line = re.sub(r"^\s*[\-\*\•]+\s*", "", line).strip()
+        if not line:
+            continue
+
+        # Categoria: João, Pedro, Carlos
+        if ":" in line:
+            left, right = line.split(":", 1)
+            cat_info = find_category_in_text(left, tournament_id)
+            if not cat_info and create_missing_categories and looks_like_category_header(left):
+                created = get_or_create_category_by_name(tournament_id, left)
+                if created:
+                    cat_info = {"id": created[0], "name": created[1], "alias": canonical_text(created[1])}
+
+            if cat_info:
+                current_category = cat_info
+                for name in split_possible_names(right):
+                    rows.append({"category_id": cat_info["id"], "category": cat_info["name"], "name": name})
+                continue
+
+        # Linha só com categoria.
+        cat_info_line = find_category_in_text(line, tournament_id)
+        if cat_info_line and (looks_like_category_header(line) or canonical_text(line) == canonical_text(cat_info_line["name"])):
+            current_category = cat_info_line
+            continue
+
+        if not cat_info_line and create_missing_categories and looks_like_category_header(line):
+            created = get_or_create_category_by_name(tournament_id, line)
+            if created:
+                current_category = {"id": created[0], "name": created[1], "alias": canonical_text(created[1])}
+                continue
+
+        # Nome - Categoria ou Categoria - Nome
+        detected = find_category_in_text(line, tournament_id)
+        if detected:
+            names = extract_names_from_line_without_category(line, detected)
+            valid_names = [n for n in names if n and canonical_text(n) != canonical_text(detected["name"]) and n.upper() != "BYE"]
+            for name in valid_names:
+                rows.append({"category_id": detected["id"], "category": detected["name"], "name": name})
+            if valid_names:
+                continue
+
+        # Se tem categoria ativa, joga a linha nela.
+        if current_category:
+            for name in split_possible_names(line):
+                rows.append({"category_id": current_category["id"], "category": current_category["name"], "name": name})
+            continue
+
+        # Se tiver fallback, usa fallback.
+        if fallback_category_id:
+            fallback = get_category(fallback_category_id)
+            for name in split_possible_names(line):
+                rows.append({"category_id": fallback_category_id, "category": fallback["name"], "name": name})
+        else:
+            name = clean_imported_name(original)
+            if name:
+                warnings.append(f"Sem categoria identificada: {name}")
+
+    # Remove duplicidade nome+categoria
+    unique = []
+    seen = set()
+    for row in rows:
+        key = (row["category_id"], normalize_name(row["name"]))
+        if key not in seen and row["name"]:
+            seen.add(key)
+            unique.append(row)
+
+    return unique, warnings
+
+
+def parse_bracket_from_pdf_or_text(text):
+    """
+    Primeiro tenta confrontos com X.
+    Se não achar, extrai nomes e organiza 1x2, 3x4...
+    """
+    pairs = parse_external_bracket_lines(text)
+    if pairs:
+        return pairs, "confrontos"
+
+    names = extract_names_from_free_text(text)
+    pairs = []
+    for i in range(0, len(names), 2):
+        p1 = names[i]
+        p2 = names[i + 1] if i + 1 < len(names) else "BYE"
+        pairs.append((p1, p2))
+
+    return pairs, "nomes"
 
 
 def parse_external_bracket_lines(text):
@@ -1251,6 +1519,88 @@ def admin_import_players_tools(tournament_id):
     cats = get_categories(tournament_id)
     cat_map = {c["name"]: c["id"] for c in cats}
 
+    with st.expander("Importação inteligente: lista única com categorias misturadas", expanded=True):
+        st.caption("Você pode colar tudo junto. Ex.: categoria em uma linha e nomes abaixo; ou Nome - Categoria; ou Categoria: João, Pedro.")
+
+        fallback_options = {"Não importar linhas sem categoria": None}
+        fallback_options.update({c["name"]: c["id"] for c in get_categories(tournament_id)})
+
+        fallback_label = st.selectbox(
+            "Quando o app não identificar a categoria",
+            list(fallback_options.keys()),
+            key="mixed_fallback_category",
+        )
+        fallback_id = fallback_options[fallback_label]
+
+        create_missing = st.checkbox(
+            "Criar categoria automaticamente se aparecer uma categoria nova na lista",
+            value=False,
+            key="mixed_create_missing",
+        )
+
+        uploaded_mixed = st.file_uploader(
+            "Subir lista única em TXT, CSV ou PDF",
+            type=["txt", "csv", "pdf"],
+            key="mixed_import_file",
+        )
+        mixed_file_text = extract_text_from_uploaded_file(uploaded_mixed) if uploaded_mixed else ""
+
+        mixed_text = st.text_area(
+            "Ou cole a lista única aqui",
+            value=mixed_file_text,
+            height=260,
+            key="mixed_import_text",
+            placeholder="3ª Classe Masculina\nJoão Silva\nPedro Santos\n\n4ª Classe Masculina\nCarlos Oliveira\nMarcos Lima\n\n2ª Classe Feminina: Maria Souza, Ana Paula",
+        )
+
+        parsed_rows, parse_warnings = parse_mixed_category_list(
+            mixed_text,
+            tournament_id,
+            fallback_category_id=fallback_id,
+            create_missing_categories=create_missing,
+        )
+
+        if parsed_rows:
+            preview_df = pd.DataFrame(parsed_rows)
+            preview_df = preview_df.rename(columns={"category": "Categoria", "name": "Atleta"})
+            st.caption(f"{len(parsed_rows)} inscrição(ões) reconhecida(s).")
+            st.dataframe(preview_df[["Categoria", "Atleta"]], use_container_width=True, hide_index=True)
+        else:
+            st.info("Cole ou envie uma lista para o app separar categoria por categoria.")
+
+        if parse_warnings:
+            with st.expander("Linhas que precisam de revisão", expanded=False):
+                for warning in parse_warnings[:80]:
+                    st.write("• " + warning)
+
+        if st.button("Importar lista única organizada automaticamente", key="mixed_import_button", use_container_width=True):
+            if not parsed_rows:
+                st.error("Nenhuma inscrição reconhecida para importar.")
+            else:
+                saved = 0
+                repeated = 0
+                full = 0
+
+                for row in parsed_rows:
+                    player_id = find_or_create_player_by_name_only(row["name"], city="Linhares")
+                    result = ensure_registration(tournament_id, row["category_id"], player_id)
+
+                    if result is True:
+                        saved += 1
+                    elif result is False:
+                        repeated += 1
+                    else:
+                        full += 1
+
+                if saved:
+                    st.success(f"{saved} inscrição(ões) importada(s).")
+                if repeated:
+                    st.warning(f"{repeated} inscrição(ões) já existiam.")
+                if full:
+                    st.error(f"{full} inscrição(ões) não entraram por limite da categoria.")
+                st.rerun()
+
+
     with st.expander("Importar lista de inscritos por texto, TXT, CSV ou PDF", expanded=False):
         if not cat_map:
             st.warning("Crie uma categoria antes de importar atletas.")
@@ -1489,23 +1839,26 @@ def admin_brackets(tournament_id):
             placeholder="João Silva x Pedro Santos\nCarlos Oliveira x BYE\nMarcos Lima x André Souza",
         )
 
-        pairs = parse_external_bracket_lines(pasted_key)
+        pairs, import_mode = parse_bracket_from_pdf_or_text(pasted_key)
 
         if pairs:
             preview = pd.DataFrame(
                 [{"Atleta 1": p1, "Atleta 2": p2} for p1, p2 in pairs]
             )
-            st.caption(f"{len(pairs)} confronto(s) encontrado(s).")
+            if import_mode == "confrontos":
+                st.caption(f"{len(pairs)} confronto(s) encontrado(s) no arquivo/texto.")
+            else:
+                st.caption(f"O app não achou confrontos com 'x', então reorganizou {len(pairs)} confronto(s) a partir da ordem dos nomes encontrados.")
             st.dataframe(preview, use_container_width=True, hide_index=True)
         else:
-            st.info("Cole confrontos no formato 'Atleta 1 x Atleta 2' para pré-visualizar.")
+            st.info("Suba um PDF/TXT/CSV da chave ou cole confrontos/nomes. O app tenta reorganizar automaticamente.")
 
         col_a, col_b = st.columns(2)
 
         with col_a:
-            if st.button("Gerar chave importada", key=f"generate_external_bracket_{category_id}", use_container_width=True):
+            if st.button("Gerar chave importada e preparar programação", key=f"generate_external_bracket_{category_id}", use_container_width=True):
                 if not pairs:
-                    st.error("Nenhum confronto encontrado para importar.")
+                    st.error("Nenhum atleta/confronto encontrado para importar.")
                 else:
                     slots = []
                     imported = 0
@@ -1522,7 +1875,9 @@ def admin_brackets(tournament_id):
                             imported += 1
 
                     generate_bracket_from_slots(tournament_id, category_id, slots)
-                    st.success(f"Chave importada com {len(pairs)} confronto(s) e {imported} atleta(s).")
+                    st.success(
+                        f"Chave reorganizada no site com {len(pairs)} confronto(s) e {imported} atleta(s). Agora já pode ir em Programação e gerar os horários."
+                    )
                     st.rerun()
 
         with col_b:

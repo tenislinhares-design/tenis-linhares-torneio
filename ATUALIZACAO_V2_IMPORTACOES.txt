@@ -1,0 +1,38 @@
+ATUALIZAÇÃO V2 — IMPORTAÇÕES E BACKUP
+====================================
+
+O que fazer:
+
+1. No GitHub, substitua:
+   - app.py
+   - requirements.txt
+   - README.md
+
+2. O arquivo supabase_schema.sql pode ficar igual.
+   Se você ainda não rodou o SQL no Supabase, rode agora.
+
+3. No Render, confira:
+
+Build Command:
+pip install -r requirements.txt
+
+Start Command:
+streamlit run app.py --server.port=$PORT --server.address=0.0.0.0
+
+4. Clique:
+Manual Deploy > Clear build cache & deploy
+
+Novidades para testar no app:
+
+- Admin > Atletas:
+  - importar lista por texto/TXT/CSV/PDF;
+  - copiar atletas de torneios anteriores;
+  - usar backup de atletas já cadastrados.
+
+- Admin > Chaves:
+  - montar chave manual;
+  - sortear chave;
+  - importar chave pronta com linhas tipo:
+    João x Pedro
+    Carlos x BYE
+  - exportar chave em CSV.
