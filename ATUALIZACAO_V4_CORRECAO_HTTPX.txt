@@ -1,0 +1,23 @@
+ATUALIZAÇÃO V4 — CORREÇÃO DO ERRO HTTPX
+======================================
+
+O erro visto na tela foi:
+
+httpx.ReadError: [Errno 11] Recursos temporariamente indisponíveis
+
+Isso acontece quando Render/Supabase oscilam ou quando a tela faz muitas leituras seguidas.
+
+Substitua no GitHub:
+
+- app.py
+- requirements.txt
+- README.md
+
+Não precisa mexer no Supabase se o SQL já foi rodado.
+
+Depois no Render:
+
+1. Manual Deploy
+2. Clear build cache & deploy
+
+Se o erro aparecer uma vez, atualize a página. A versão V4 já tenta repetir automaticamente antes de mostrar erro.

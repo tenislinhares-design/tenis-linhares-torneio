@@ -1,6 +1,7 @@
 import os
 import math
 import random
+import time
 import re
 import io
 import csv
@@ -61,6 +62,24 @@ def sb():
     return get_supabase()
 
 
+def execute_query(query, attempts=4):
+    """
+    Render gratuito + Supabase podem oscilar em algumas leituras.
+    Esta função tenta novamente antes de mostrar erro ao usuário.
+    """
+    last_error = None
+
+    for attempt in range(attempts):
+        try:
+            return query.execute()
+        except Exception as exc:
+            last_error = exc
+            if attempt < attempts - 1:
+                time.sleep(0.7 * (attempt + 1))
+
+    raise last_error
+
+
 def response_data(resp):
     return getattr(resp, "data", None) or []
 
@@ -70,34 +89,33 @@ def first(rows):
 
 
 def insert_row(table, payload):
-    rows = response_data(sb().table(table).insert(payload).execute())
+    rows = response_data(execute_query(sb().table(table).insert(payload)))
     return first(rows)
 
 
 def update_row(table, row_id, payload):
-    return sb().table(table).update(payload).eq("id", row_id).execute()
+    return execute_query(sb().table(table).update(payload).eq("id", row_id))
 
 
 def delete_matches_by_category(tournament_id, category_id):
-    return (
+    return execute_query(
         sb()
         .table(T_MATCHES)
         .delete()
         .eq("tournament_id", tournament_id)
         .eq("category_id", category_id)
-        .execute()
     )
 
 
 def get_by_id(table, row_id):
     if not row_id:
         return None
-    rows = response_data(sb().table(table).select("*").eq("id", row_id).execute())
+    rows = response_data(execute_query(sb().table(table).select("*").eq("id", row_id)))
     return first(rows)
 
 
 def get_tournaments():
-    return response_data(sb().table(T_TOURNAMENTS).select("*").order("id", desc=True).execute())
+    return response_data(execute_query(sb().table(T_TOURNAMENTS).select("*").order("id", desc=True)))
 
 
 def get_tournament(tournament_id):
@@ -106,12 +124,13 @@ def get_tournament(tournament_id):
 
 def get_categories(tournament_id):
     return response_data(
-        sb()
-        .table(T_CATEGORIES)
-        .select("*")
-        .eq("tournament_id", tournament_id)
-        .order("name")
-        .execute()
+        execute_query(
+            sb()
+            .table(T_CATEGORIES)
+            .select("*")
+            .eq("tournament_id", tournament_id)
+            .order("name")
+        )
     )
 
 
@@ -134,7 +153,7 @@ def get_matches(tournament_id, category_id=None):
     )
     if category_id:
         q = q.eq("category_id", category_id)
-    return response_data(q.execute())
+    return response_data(execute_query(q))
 
 
 def get_match(match_id):
@@ -150,18 +169,19 @@ def get_registrations(tournament_id, category_id=None):
     )
     if category_id:
         q = q.eq("category_id", category_id)
-    return response_data(q.execute())
+    return response_data(execute_query(q))
 
 
 def registration_exists(tournament_id, category_id, player_id):
     rows = response_data(
-        sb()
-        .table(T_REGISTRATIONS)
-        .select("id")
-        .eq("tournament_id", tournament_id)
-        .eq("category_id", category_id)
-        .eq("player_id", player_id)
-        .execute()
+        execute_query(
+            sb()
+            .table(T_REGISTRATIONS)
+            .select("id")
+            .eq("tournament_id", tournament_id)
+            .eq("category_id", category_id)
+            .eq("player_id", player_id)
+        )
     )
     return bool(rows)
 
@@ -169,7 +189,7 @@ def registration_exists(tournament_id, category_id, player_id):
 def get_player_by_whatsapp(whatsapp):
     if not whatsapp:
         return None
-    rows = response_data(sb().table(T_PLAYERS).select("*").eq("whatsapp", whatsapp).execute())
+    rows = response_data(execute_query(sb().table(T_PLAYERS).select("*").eq("whatsapp", whatsapp)))
     return first(rows)
 
 
@@ -178,7 +198,7 @@ def normalize_name(name):
 
 
 def get_all_players():
-    return response_data(sb().table(T_PLAYERS).select("*").execute())
+    return response_data(execute_query(sb().table(T_PLAYERS).select("*")))
 
 
 def get_player_by_name(name):
@@ -1375,6 +1395,13 @@ def admin_categories(tournament_id):
                 st.success("Categoria adicionada.")
                 st.rerun()
 
+    all_regs = get_registrations(tournament_id)
+    counts_by_category = {}
+
+    for reg in all_regs:
+        category_id = reg.get("category_id")
+        counts_by_category[category_id] = counts_by_category.get(category_id, 0) + 1
+
     rows = []
     for cat in get_categories(tournament_id):
         rows.append(
@@ -1382,7 +1409,7 @@ def admin_categories(tournament_id):
                 "id": cat["id"],
                 "Categoria": cat["name"],
                 "Limite": cat["max_players"],
-                "Inscritos": len(get_registrations(tournament_id, cat["id"])),
+                "Inscritos": counts_by_category.get(cat["id"], 0),
             }
         )
 
@@ -2074,10 +2101,15 @@ def main():
     menu = st.sidebar.radio("Menu", ["Área pública", "Admin"])
     st.sidebar.caption("App teste separado do site oficial.")
 
-    if menu == "Área pública":
-        public_page()
-    else:
-        admin_page()
+    try:
+        if menu == "Área pública":
+            public_page()
+        else:
+            admin_page()
+    except Exception as exc:
+        st.error("O Supabase ou o Render oscilou durante esta leitura.")
+        st.info("Clique em atualizar a página. Se persistir, faça um novo deploy com cache limpo no Render.")
+        st.code(str(exc))
 
 
 if __name__ == "__main__":
