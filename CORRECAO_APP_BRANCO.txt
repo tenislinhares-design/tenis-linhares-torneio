@@ -1,0 +1,46 @@
+CORREÇÃO DO APP BRANCO
+======================
+
+O app ficou branco porque os arquivos subidos antes estavam quebrados:
+- app.py ficou praticamente todo em uma linha só;
+- requirements.txt ficou vazio;
+- supabase_schema.sql ficou vazio.
+
+FAÇA AGORA
+==========
+
+1. No GitHub, entre no repositório:
+   tenis-linhares-torneio
+
+2. Substitua os arquivos atuais por estes 4 arquivos deste ZIP:
+   - app.py
+   - requirements.txt
+   - supabase_schema.sql
+   - README.md
+
+3. No Supabase:
+   - abra o arquivo supabase_schema.sql;
+   - copie tudo;
+   - cole no SQL Editor;
+   - clique em Run.
+
+4. No Render, confira:
+
+Build Command:
+pip install -r requirements.txt
+
+Start Command:
+streamlit run app.py --server.port=$PORT --server.address=0.0.0.0
+
+Root Directory:
+deixar vazio
+
+5. No Render, em Environment, coloque:
+
+SUPABASE_URL=https://cdauipvwgvfwpvphizjx.supabase.co
+NEXT_PUBLIC_SUPABASE_URL=https://cdauipvwgvfwpvphizjx.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=sua_chave_service_role
+ADMIN_PASSWORD=sua_senha
+
+6. Depois clique:
+Manual Deploy > Clear build cache & deploy

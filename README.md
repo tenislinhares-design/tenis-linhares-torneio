@@ -7,35 +7,47 @@ App teste separado para validar o módulo de torneios antes de integrar no site 
 - Criar torneio
 - Criar categorias
 - Cadastrar atletas
-- Mesmo atleta em mais de uma categoria
+- Permitir mesmo atleta em mais de uma categoria
 - Marcar atleta de Linhares ou de fora
-- Chave por sorteio automático
-- Chave manual
-- Programação automática
+- Gerar chave por sorteio automático
+- Montar chave manual
+- Gerar programação automática
 - 3 quadras por horário
 - Jogos de 1h30
 - Segunda a quinta: 16:00, 17:30, 19:00, 20:30
 - Sexta: 15:30, 17:00, 18:30, 20:00, 21:30
 - Lançar resultado
 - Vencedor avança automaticamente
-- Área pública com programação e chave
+- Área pública com programação, chaves e inscritos
 
-## Como rodar
+## Render
+
+Build Command:
 
 ```bash
 pip install -r requirements.txt
-streamlit run app.py
 ```
 
-## Antes de rodar
+Start Command:
 
-1. Rode `supabase_schema.sql` no SQL Editor do Supabase.
-2. Configure as variáveis do app:
+```bash
+streamlit run app.py --server.port=$PORT --server.address=0.0.0.0
+```
+
+## Variáveis no Render
 
 ```env
 SUPABASE_URL=https://SEU-PROJETO.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=SUA_CHAVE_SERVICE_ROLE
+SUPABASE_SERVICE_ROLE_KEY=SUA_SERVICE_ROLE_KEY
 ADMIN_PASSWORD=sua_senha
 ```
 
-O app também aceita `NEXT_PUBLIC_SUPABASE_URL` e `ADMIN_TOKEN` se você quiser reaproveitar nomes antigos.
+## Supabase
+
+Antes de rodar o app, execute o arquivo:
+
+```text
+supabase_schema.sql
+```
+
+no SQL Editor do Supabase.

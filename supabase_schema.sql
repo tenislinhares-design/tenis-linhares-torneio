@@ -1,6 +1,5 @@
--- Tênis Linhares — Módulo de Torneios
--- Rode este arquivo no SQL Editor do Supabase.
--- As tabelas usam prefixo tl_ para não misturar com o antigo projeto de gols.
+-- TÊNIS LINHARES — TORNEIOS
+-- Cole este arquivo no SQL Editor do Supabase e clique em Run.
 
 create table if not exists public.tl_tournaments (
   id bigint generated always as identity primary key,
@@ -68,8 +67,6 @@ create index if not exists tl_registrations_tournament_category_idx on public.tl
 create index if not exists tl_matches_tournament_category_idx on public.tl_matches(tournament_id, category_id);
 create index if not exists tl_matches_schedule_idx on public.tl_matches(scheduled_date, scheduled_time, court);
 
--- App teste usa SUPABASE_SERVICE_ROLE_KEY no servidor.
--- Para teste, deixamos RLS desativado nestas tabelas tl_.
 alter table public.tl_tournaments disable row level security;
 alter table public.tl_categories disable row level security;
 alter table public.tl_players disable row level security;

@@ -1,17 +1,26 @@
 import os
 import math
 import random
-from datetime import datetime, date, timedelta
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import streamlit as st
 from supabase import create_client
 
-TABLE_TOURNAMENTS = "tl_tournaments"
-TABLE_CATEGORIES = "tl_categories"
-TABLE_PLAYERS = "tl_players"
-TABLE_REGISTRATIONS = "tl_registrations"
-TABLE_MATCHES = "tl_matches"
+
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
+
+SUPABASE_URL = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD") or os.getenv("ADMIN_TOKEN") or "1234"
+
+T_TOURNAMENTS = "tl_tournaments"
+T_CATEGORIES = "tl_categories"
+T_PLAYERS = "tl_players"
+T_REGISTRATIONS = "tl_registrations"
+T_MATCHES = "tl_matches"
 
 DEFAULT_CATEGORIES = [
     "1ª Classe Masculina",
@@ -27,123 +36,190 @@ DEFAULT_CATEGORIES = [
     "Duplas 2ª Classe",
 ]
 
-BRAND_GREEN = "#CCFF00"
-DARK_BG = "#0d1110"
-CARD_BG = "#151c18"
+WEEKDAY_TIMES = ["16:00", "17:30", "19:00", "20:30"]
+FRIDAY_TIMES = ["15:30", "17:00", "18:30", "20:00", "21:30"]
+WEEKEND_TIMES = ["08:00", "09:30", "11:00", "14:00", "15:30", "17:00", "18:30", "20:00"]
 
 
-def get_secret(name, default=""):
-    try:
-        if name in st.secrets:
-            return str(st.secrets[name])
-    except Exception:
-        pass
-    return os.getenv(name, default)
-
+# ============================================================
+# SUPABASE
+# ============================================================
 
 @st.cache_resource
 def get_supabase():
-    url = get_secret("SUPABASE_URL") or get_secret("NEXT_PUBLIC_SUPABASE_URL")
-    key = get_secret("SUPABASE_SERVICE_ROLE_KEY")
-    if not url or not key:
-        st.error("Configure SUPABASE_URL/NEXT_PUBLIC_SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY nas variáveis do app.")
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        st.error("Configure SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY nas variáveis do Render.")
         st.stop()
-    return create_client(url, key)
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def sb():
     return get_supabase()
 
 
-def data(resp):
+def response_data(resp):
     return getattr(resp, "data", None) or []
 
 
-def insert(table, payload):
-    rows = data(sb().table(table).insert(payload).execute())
+def first(rows):
     return rows[0] if rows else None
 
 
-def update_by_id(table, row_id, payload):
+def insert_row(table, payload):
+    rows = response_data(sb().table(table).insert(payload).execute())
+    return first(rows)
+
+
+def update_row(table, row_id, payload):
     return sb().table(table).update(payload).eq("id", row_id).execute()
 
 
-def select_by_id(table, row_id):
-    rows = data(sb().table(table).select("*").eq("id", row_id).execute())
-    return rows[0] if rows else None
+def delete_matches_by_category(tournament_id, category_id):
+    return (
+        sb()
+        .table(T_MATCHES)
+        .delete()
+        .eq("tournament_id", tournament_id)
+        .eq("category_id", category_id)
+        .execute()
+    )
 
 
-def tournaments():
-    return data(sb().table(TABLE_TOURNAMENTS).select("*").order("id", desc=True).execute())
+def get_by_id(table, row_id):
+    if not row_id:
+        return None
+    rows = response_data(sb().table(table).select("*").eq("id", row_id).execute())
+    return first(rows)
 
 
-def categories(tournament_id):
-    return data(sb().table(TABLE_CATEGORIES).select("*").eq("tournament_id", tournament_id).order("name").execute())
+def get_tournaments():
+    return response_data(sb().table(T_TOURNAMENTS).select("*").order("id", desc=True).execute())
 
 
-def players_all():
-    return data(sb().table(TABLE_PLAYERS).select("*").order("name").execute())
+def get_tournament(tournament_id):
+    return get_by_id(T_TOURNAMENTS, tournament_id)
 
 
-def registrations(tournament_id, category_id=None):
-    q = sb().table(TABLE_REGISTRATIONS).select("*").eq("tournament_id", tournament_id)
+def get_categories(tournament_id):
+    return response_data(
+        sb()
+        .table(T_CATEGORIES)
+        .select("*")
+        .eq("tournament_id", tournament_id)
+        .order("name")
+        .execute()
+    )
+
+
+def get_category(category_id):
+    return get_by_id(T_CATEGORIES, category_id)
+
+
+def get_player(player_id):
+    return get_by_id(T_PLAYERS, player_id)
+
+
+def get_matches(tournament_id, category_id=None):
+    q = (
+        sb()
+        .table(T_MATCHES)
+        .select("*")
+        .eq("tournament_id", tournament_id)
+        .order("round_num")
+        .order("position")
+    )
     if category_id:
         q = q.eq("category_id", category_id)
-    return data(q.execute())
+    return response_data(q.execute())
 
 
-def matches(tournament_id, category_id=None):
-    q = sb().table(TABLE_MATCHES).select("*").eq("tournament_id", tournament_id).order("round_num").order("position")
+def get_match(match_id):
+    return get_by_id(T_MATCHES, match_id)
+
+
+def get_registrations(tournament_id, category_id=None):
+    q = (
+        sb()
+        .table(T_REGISTRATIONS)
+        .select("*, player:tl_players(*), category:tl_categories(*)")
+        .eq("tournament_id", tournament_id)
+    )
     if category_id:
         q = q.eq("category_id", category_id)
-    return data(q.execute())
+    return response_data(q.execute())
 
 
-def player(player_id):
-    return select_by_id(TABLE_PLAYERS, player_id) if player_id else None
+def registration_exists(tournament_id, category_id, player_id):
+    rows = response_data(
+        sb()
+        .table(T_REGISTRATIONS)
+        .select("id")
+        .eq("tournament_id", tournament_id)
+        .eq("category_id", category_id)
+        .eq("player_id", player_id)
+        .execute()
+    )
+    return bool(rows)
 
 
-def category(category_id):
-    return select_by_id(TABLE_CATEGORIES, category_id) if category_id else None
+def get_player_by_whatsapp(whatsapp):
+    if not whatsapp:
+        return None
+    rows = response_data(sb().table(T_PLAYERS).select("*").eq("whatsapp", whatsapp).execute())
+    return first(rows)
 
 
-def tournament(tournament_id):
-    return select_by_id(TABLE_TOURNAMENTS, tournament_id) if tournament_id else None
-
-
-def player_name(player_id):
-    p = player(player_id)
-    if not p:
-        return "Aguardando"
-    return p.get("name", "Atleta") + (" • fora" if p.get("is_outside") else "")
-
-
-def category_name(category_id):
-    c = category(category_id)
-    return c.get("name", "") if c else ""
-
-
-def match_label(m):
-    p1 = player_name(m.get("player1_id"))
-    p2 = player_name(m.get("player2_id"))
-    if not m.get("player1_id") and m.get("source1_match_id"):
-        p1 = f"Vencedor Jogo {m['source1_match_id']}"
-    if not m.get("player2_id") and m.get("source2_match_id"):
-        p2 = f"Vencedor Jogo {m['source2_match_id']}"
-    return f"{p1} x {p2}"
-
+# ============================================================
+# VISUAL
+# ============================================================
 
 def apply_css():
     st.markdown(
-        f"""
+        """
         <style>
-        .stApp {{ background: radial-gradient(circle at top, #1a2b1d 0%, {DARK_BG} 48%, #070907 100%); color:#f7fff7; }}
-        section[data-testid="stSidebar"] {{ background-color:#0b0f0d; }}
-        div[data-testid="stMetric"] {{ background:{CARD_BG}; border:1px solid rgba(204,255,0,.25); padding:14px; border-radius:18px; }}
-        .tl-card {{ background:rgba(21,28,24,.92); border:1px solid rgba(204,255,0,.22); border-radius:18px; padding:18px; margin:10px 0 18px 0; box-shadow:0 12px 30px rgba(0,0,0,.25); }}
-        .tl-title {{ font-size:28px; font-weight:900; color:{BRAND_GREEN}; margin-bottom:0; }}
-        .tl-sub {{ color:#d8ead8; font-size:15px; margin-top:4px; }}
-        .tl-badge {{ display:inline-block; background:rgba(204,255,0,.14); border:1px solid rgba(204,255,0,.35); color:{BRAND_GREEN}; border-radius:999px; padding:4px 10px; font-size:12px; font-weight:700; margin:3px 3px 3px 0; }}
+        .stApp {
+            background: radial-gradient(circle at top, #1b301f 0%, #0d1110 48%, #070907 100%);
+            color: #f7fff7;
+        }
+        section[data-testid="stSidebar"] {
+            background-color: #0b0f0d;
+        }
+        .tl-card {
+            background: rgba(21,28,24,.94);
+            border: 1px solid rgba(204,255,0,.24);
+            border-radius: 20px;
+            padding: 20px;
+            margin-bottom: 18px;
+            box-shadow: 0 12px 28px rgba(0,0,0,.28);
+        }
+        .tl-title {
+            color: #CCFF00;
+            font-size: 30px;
+            font-weight: 900;
+            margin: 0;
+        }
+        .tl-sub {
+            color: #e3f4df;
+            font-size: 15px;
+            margin-top: 5px;
+        }
+        .tl-badge {
+            display: inline-block;
+            padding: 5px 10px;
+            margin: 8px 4px 0 0;
+            color: #CCFF00;
+            border: 1px solid rgba(204,255,0,.35);
+            background: rgba(204,255,0,.12);
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 800;
+        }
+        div[data-testid="stMetric"] {
+            background: rgba(21,28,24,.94);
+            border: 1px solid rgba(204,255,0,.22);
+            padding: 14px;
+            border-radius: 18px;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -154,499 +230,967 @@ def header():
     st.markdown(
         """
         <div class="tl-card">
-            <div class="tl-title">Tênis Linhares • Torneios Supabase</div>
-            <div class="tl-sub">Teste separado para chaves, programação automática, resultados e avanço de fase.</div>
-            <span class="tl-badge">Supabase</span>
+            <p class="tl-title">Tênis Linhares • Torneios</p>
+            <div class="tl-sub">App teste separado com Supabase, chaves, programação automática e avanço de fase.</div>
             <span class="tl-badge">3 quadras</span>
             <span class="tl-badge">1h30 por jogo</span>
-            <span class="tl-badge">seg-qui até 20:30</span>
-            <span class="tl-badge">sexta desde 15:30</span>
+            <span class="tl-badge">Chave manual</span>
+            <span class="tl-badge">Sorteio automático</span>
+            <span class="tl-badge">Vencedor avança sozinho</span>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def create_default_categories(tid):
-    existing = {c["name"] for c in categories(tid)}
+# ============================================================
+# REGRAS DE TORNEIO
+# ============================================================
+
+def create_default_categories(tournament_id):
+    existing = {c["name"] for c in get_categories(tournament_id)}
     for name in DEFAULT_CATEGORIES:
         if name not in existing:
-            insert(TABLE_CATEGORIES, {"tournament_id": tid, "name": name, "max_players": 16})
+            insert_row(
+                T_CATEGORIES,
+                {
+                    "tournament_id": tournament_id,
+                    "name": name,
+                    "max_players": 16,
+                },
+            )
 
 
 def seed_if_empty():
-    if tournaments():
+    if get_tournaments():
         return
-    t = insert(TABLE_TOURNAMENTS, {
-        "name": "Torneio Teste Tênis Linhares",
-        "start_date": date.today().isoformat(),
-        "end_date": (date.today() + timedelta(days=6)).isoformat(),
-        "active": True,
-    })
-    if t:
-        create_default_categories(t["id"])
+
+    tournament = insert_row(
+        T_TOURNAMENTS,
+        {
+            "name": "Torneio Teste Tênis Linhares",
+            "start_date": date.today().isoformat(),
+            "end_date": (date.today() + timedelta(days=6)).isoformat(),
+            "active": True,
+        },
+    )
+    if tournament:
+        create_default_categories(tournament["id"])
 
 
-def tournament_selector():
-    ts = tournaments()
-    if not ts:
-        st.warning("Nenhum torneio cadastrado.")
-        return None
-    labels = {f"{t['name']} • {t['start_date']} a {t['end_date']}": t["id"] for t in ts}
-    return labels[st.selectbox("Torneio", list(labels.keys()))]
-
-
-def category_selector(tid, key):
-    cs = categories(tid)
-    if not cs:
-        st.warning("Nenhuma categoria cadastrada.")
-        return None
-    labels = {c["name"]: c["id"] for c in cs}
-    return labels[st.selectbox("Categoria", list(labels.keys()), key=key)]
-
-
-def player_ids_in_category(tid, cid):
-    regs = registrations(tid, cid)
-    return [r["player_id"] for r in regs]
-
-
-def registered_players(tid, cid):
-    ps = [player(pid) for pid in player_ids_in_category(tid, cid)]
-    return sorted([p for p in ps if p], key=lambda x: x.get("name", ""))
-
-
-def next_power_of_two(n):
-    return 1 if n <= 1 else 2 ** math.ceil(math.log2(n))
+def next_power_two(n):
+    if n <= 1:
+        return 1
+    return 2 ** math.ceil(math.log2(n))
 
 
 def round_names(size):
-    return {
+    names = {
         2: ["Final"],
         4: ["Semifinal", "Final"],
         8: ["Quartas de final", "Semifinal", "Final"],
         16: ["Oitavas de final", "Quartas de final", "Semifinal", "Final"],
         32: ["32 avos", "Oitavas de final", "Quartas de final", "Semifinal", "Final"],
-    }.get(size, [f"Rodada {i+1}" for i in range(int(math.log2(size)))])
+    }
+    return names.get(size, [f"Rodada {i+1}" for i in range(int(math.log2(size)))])
 
 
-def delete_category_matches(tid, cid):
-    sb().table(TABLE_MATCHES).delete().eq("tournament_id", tid).eq("category_id", cid).execute()
+def player_label(player_id):
+    p = get_player(player_id)
+    if not p:
+        return "Aguardando"
+    suffix = " • fora" if p.get("is_outside") else ""
+    return f'{p.get("name", "Atleta")}{suffix}'
 
 
-def refresh_bracket(tid, cid):
-    ms = matches(tid, cid)
-    winners = {m["id"]: m.get("winner_id") for m in ms}
-    for m in ms:
-        payload = {}
-        if m.get("source1_match_id"):
-            payload["player1_id"] = winners.get(m["source1_match_id"])
-        if m.get("source2_match_id"):
-            payload["player2_id"] = winners.get(m["source2_match_id"])
-        if payload:
-            update_by_id(TABLE_MATCHES, m["id"], payload)
-
-    for m in matches(tid, cid):
-        if not m.get("source1_match_id") and not m.get("source2_match_id") and m.get("status") != "finalizado":
-            if m.get("player1_id") and not m.get("player2_id"):
-                update_by_id(TABLE_MATCHES, m["id"], {"winner_id": m["player1_id"], "status": "bye"})
-            elif m.get("player2_id") and not m.get("player1_id"):
-                update_by_id(TABLE_MATCHES, m["id"], {"winner_id": m["player2_id"], "status": "bye"})
+def category_label(category_id):
+    c = get_category(category_id)
+    return c.get("name", "") if c else ""
 
 
-def generate_bracket(tid, cid, ordered_ids):
-    ids = [x for x in ordered_ids if x]
-    if len(ids) < 2:
-        raise ValueError("É necessário ter pelo menos 2 atletas.")
-    size = max(2, next_power_of_two(len(ids)))
+def match_label(match):
+    p1 = player_label(match.get("player1_id"))
+    p2 = player_label(match.get("player2_id"))
+
+    if not match.get("player1_id") and match.get("source1_match_id"):
+        p1 = f'Vencedor Jogo {match["source1_match_id"]}'
+    if not match.get("player2_id") and match.get("source2_match_id"):
+        p2 = f'Vencedor Jogo {match["source2_match_id"]}'
+
+    return f"{p1} x {p2}"
+
+
+def registered_players(tournament_id, category_id):
+    regs = get_registrations(tournament_id, category_id)
+    players = [r["player"] for r in regs if r.get("player")]
+    return sorted(players, key=lambda p: p.get("name", ""))
+
+
+def generate_bracket(tournament_id, category_id, ordered_player_ids):
+    player_ids = [pid for pid in ordered_player_ids if pid]
+
+    if len(player_ids) < 2:
+        raise ValueError("Precisa de pelo menos 2 atletas para gerar a chave.")
+
+    size = max(2, next_power_two(len(player_ids)))
     if size > 32:
-        raise ValueError("Teste suporta até 32 atletas; o padrão recomendado é 16.")
-    slots = ids + [None] * (size - len(ids))
+        raise ValueError("Este app teste suporta até 32 atletas por categoria.")
+
+    slots = player_ids + [None] * (size - len(player_ids))
     names = round_names(size)
     rounds = int(math.log2(size))
-    delete_category_matches(tid, cid)
 
-    previous = []
-    for r in range(1, rounds + 1):
-        current = []
-        count = size // (2 ** r)
-        round_name = names[r - 1]
-        for pos in range(count):
-            if r == 1:
-                p1, p2 = slots[pos * 2], slots[pos * 2 + 1]
-                source1 = source2 = winner = None
+    delete_matches_by_category(tournament_id, category_id)
+
+    previous_match_ids = []
+
+    for round_num in range(1, rounds + 1):
+        match_count = size // (2 ** round_num)
+        current_ids = []
+        round_name = names[round_num - 1]
+
+        for position in range(match_count):
+            if round_num == 1:
+                p1 = slots[position * 2]
+                p2 = slots[position * 2 + 1]
+                source1 = None
+                source2 = None
+                winner = None
                 status = "pendente"
+
                 if p1 and not p2:
-                    winner, status = p1, "bye"
+                    winner = p1
+                    status = "bye"
                 elif p2 and not p1:
-                    winner, status = p2, "bye"
+                    winner = p2
+                    status = "bye"
             else:
-                p1 = p2 = winner = None
-                source1, source2 = previous[pos * 2], previous[pos * 2 + 1]
+                p1 = None
+                p2 = None
+                source1 = previous_match_ids[position * 2]
+                source2 = previous_match_ids[position * 2 + 1]
+                winner = None
                 status = "pendente"
-            row = insert(TABLE_MATCHES, {
-                "tournament_id": tid, "category_id": cid, "round_num": r, "round_name": round_name,
-                "position": pos + 1, "player1_id": p1, "player2_id": p2,
-                "source1_match_id": source1, "source2_match_id": source2,
-                "winner_id": winner, "status": status,
-            })
-            current.append(row["id"])
-        previous = current
-    refresh_bracket(tid, cid)
+
+            created = insert_row(
+                T_MATCHES,
+                {
+                    "tournament_id": tournament_id,
+                    "category_id": category_id,
+                    "round_num": round_num,
+                    "round_name": round_name,
+                    "position": position + 1,
+                    "player1_id": p1,
+                    "player2_id": p2,
+                    "source1_match_id": source1,
+                    "source2_match_id": source2,
+                    "winner_id": winner,
+                    "status": status,
+                },
+            )
+
+            if created:
+                current_ids.append(created["id"])
+
+        previous_match_ids = current_ids
+
+    refresh_bracket(tournament_id, category_id)
 
 
-def pids_for_match(m):
-    return [pid for pid in [m.get("player1_id"), m.get("player2_id")] if pid]
+def refresh_bracket(tournament_id, category_id):
+    matches = get_matches(tournament_id, category_id)
+    winners = {m["id"]: m.get("winner_id") for m in matches}
+
+    for match in matches:
+        payload = {}
+
+        if match.get("source1_match_id"):
+            payload["player1_id"] = winners.get(match["source1_match_id"])
+
+        if match.get("source2_match_id"):
+            payload["player2_id"] = winners.get(match["source2_match_id"])
+
+        if payload:
+            update_row(T_MATCHES, match["id"], payload)
+
+    matches = get_matches(tournament_id, category_id)
+
+    for match in matches:
+        if match.get("source1_match_id") or match.get("source2_match_id"):
+            continue
+
+        if match.get("status") == "finalizado":
+            continue
+
+        if match.get("player1_id") and not match.get("player2_id"):
+            update_row(
+                T_MATCHES,
+                match["id"],
+                {"winner_id": match["player1_id"], "status": "bye"},
+            )
+        elif match.get("player2_id") and not match.get("player1_id"):
+            update_row(
+                T_MATCHES,
+                match["id"],
+                {"winner_id": match["player2_id"], "status": "bye"},
+            )
 
 
-def has_outside(m):
-    for pid in pids_for_match(m):
-        p = player(pid)
+def match_players(match):
+    players = []
+    if match.get("player1_id"):
+        players.append(match["player1_id"])
+    if match.get("player2_id"):
+        players.append(match["player2_id"])
+    return players
+
+
+def has_outside_player(match):
+    for player_id in match_players(match):
+        p = get_player(player_id)
         if p and p.get("is_outside"):
             return True
     return False
 
 
-def parse_dt(d, t):
-    return datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M")
+def parse_datetime(day, hour):
+    return datetime.strptime(f"{day} {hour}", "%Y-%m-%d %H:%M")
 
 
 def build_slots(start_date, end_date, include_weekend=True):
     slots = []
-    d = datetime.strptime(start_date, "%Y-%m-%d").date()
-    end = datetime.strptime(end_date, "%Y-%m-%d").date()
-    while d <= end:
-        wd = d.weekday()
-        if wd in [0, 1, 2, 3]:
-            times = ["16:00", "17:30", "19:00", "20:30"]
-        elif wd == 4:
-            times = ["15:30", "17:00", "18:30", "20:00", "21:30"]
+    current = datetime.strptime(start_date, "%Y-%m-%d").date()
+    final = datetime.strptime(end_date, "%Y-%m-%d").date()
+
+    while current <= final:
+        weekday = current.weekday()
+
+        if weekday in [0, 1, 2, 3]:
+            times = WEEKDAY_TIMES
+        elif weekday == 4:
+            times = FRIDAY_TIMES
         elif include_weekend:
-            times = ["08:00", "09:30", "11:00", "14:00", "15:30", "17:00", "18:30", "20:00"]
+            times = WEEKEND_TIMES
         else:
             times = []
-        for t in times:
+
+        for hour in times:
             for court in [1, 2, 3]:
-                slots.append({"date": d.isoformat(), "time": t, "court": court, "dt": parse_dt(d.isoformat(), t), "weekday": wd})
-        d += timedelta(days=1)
+                slots.append(
+                    {
+                        "date": current.isoformat(),
+                        "time": hour,
+                        "court": court,
+                        "dt": parse_datetime(current.isoformat(), hour),
+                        "weekday": weekday,
+                    }
+                )
+
+        current += timedelta(days=1)
+
     return slots
 
 
-def clear_schedule(tid):
-    sb().table(TABLE_MATCHES).update({"scheduled_date": None, "scheduled_time": None, "court": None}).eq("tournament_id", tid).execute()
+def clear_schedule(tournament_id):
+    for match in get_matches(tournament_id):
+        update_row(
+            T_MATCHES,
+            match["id"],
+            {
+                "scheduled_date": None,
+                "scheduled_time": None,
+                "court": None,
+            },
+        )
 
 
-def generate_schedule(tid, include_weekend=True):
-    t = tournament(tid)
-    clear_schedule(tid)
-    slots = build_slots(t["start_date"], t["end_date"], include_weekend)
-    used, player_busy, scheduled_dt, pending = set(), set(), {}, []
-    ms = sorted(matches(tid), key=lambda m: (m.get("round_num", 1), m.get("category_id", 0), m.get("position", 0)))
+def generate_schedule(tournament_id, include_weekend=True):
+    tournament = get_tournament(tournament_id)
+    if not tournament:
+        raise ValueError("Torneio não encontrado.")
 
-    def score(slot, m):
-        value = slot["dt"].timestamp()
-        if has_outside(m):
+    clear_schedule(tournament_id)
+
+    slots = build_slots(tournament["start_date"], tournament["end_date"], include_weekend)
+    matches = get_matches(tournament_id)
+
+    used_slots = set()
+    player_busy = set()
+    match_datetime = {}
+    pending = []
+
+    def slot_score(slot, match):
+        score = slot["dt"].timestamp()
+
+        if has_outside_player(match):
             if slot["weekday"] == 4:
-                value -= 10000000
+                score -= 10_000_000
             elif slot["weekday"] in [5, 6]:
-                value -= 9000000
-        return value
+                score -= 9_000_000
 
-    for m in ms:
-        ok = False
-        for slot in sorted(slots, key=lambda s: score(s, m)):
-            skey = (slot["date"], slot["time"], slot["court"])
-            if skey in used:
+        return score
+
+    matches = sorted(
+        matches,
+        key=lambda m: (m.get("round_num", 1), m.get("category_id", 0), m.get("position", 0)),
+    )
+
+    for match in matches:
+        assigned = False
+        players = match_players(match)
+
+        for slot in sorted(slots, key=lambda s: slot_score(s, match)):
+            slot_key = (slot["date"], slot["time"], slot["court"])
+
+            if slot_key in used_slots:
                 continue
+
+            conflict = any((pid, slot["date"], slot["time"]) in player_busy for pid in players)
+            if conflict:
+                continue
+
             too_early = False
-            for sid in [m.get("source1_match_id"), m.get("source2_match_id")]:
-                if sid and sid in scheduled_dt and slot["dt"] < scheduled_dt[sid] + timedelta(minutes=90):
-                    too_early = True
-                    break
+            for source_id in [match.get("source1_match_id"), match.get("source2_match_id")]:
+                if source_id and source_id in match_datetime:
+                    if slot["dt"] < match_datetime[source_id] + timedelta(minutes=90):
+                        too_early = True
+                        break
+
             if too_early:
                 continue
-            if any((pid, slot["date"], slot["time"]) in player_busy for pid in pids_for_match(m)):
-                continue
-            update_by_id(TABLE_MATCHES, m["id"], {"scheduled_date": slot["date"], "scheduled_time": slot["time"], "court": slot["court"]})
-            used.add(skey)
-            scheduled_dt[m["id"]] = slot["dt"]
-            for pid in pids_for_match(m):
-                player_busy.add((pid, slot["date"], slot["time"]))
-            ok = True
+
+            update_row(
+                T_MATCHES,
+                match["id"],
+                {
+                    "scheduled_date": slot["date"],
+                    "scheduled_time": slot["time"],
+                    "court": slot["court"],
+                },
+            )
+
+            used_slots.add(slot_key)
+            match_datetime[match["id"]] = slot["dt"]
+
+            for player_id in players:
+                player_busy.add((player_id, slot["date"], slot["time"]))
+
+            assigned = True
             break
-        if not ok:
-            pending.append(m["id"])
-    return len(ms) - len(pending), len(pending)
+
+        if not assigned:
+            pending.append(match["id"])
+
+    return len(matches) - len(pending), len(pending)
 
 
-def schedule_df(tid):
+# ============================================================
+# DATAFRAMES
+# ============================================================
+
+def schedule_df(tournament_id):
     rows = []
-    for m in matches(tid):
-        rows.append({
-            "Data": m.get("scheduled_date") or "",
-            "Horário": m.get("scheduled_time") or "",
-            "Quadra": m.get("court") or "",
-            "Categoria": category_name(m["category_id"]),
-            "Fase": m.get("round_name") or "",
-            "Jogo": m["id"],
-            "Confronto": match_label(m),
-            "Placar": m.get("score") or "",
-            "Vencedor": player_name(m.get("winner_id")) if m.get("winner_id") else "",
-            "Status": m.get("status") or "",
-        })
+
+    for match in get_matches(tournament_id):
+        rows.append(
+            {
+                "Data": match.get("scheduled_date") or "",
+                "Horário": match.get("scheduled_time") or "",
+                "Quadra": match.get("court") or "",
+                "Categoria": category_label(match["category_id"]),
+                "Fase": match.get("round_name") or "",
+                "Jogo": match["id"],
+                "Confronto": match_label(match),
+                "Placar": match.get("score") or "",
+                "Vencedor": player_label(match.get("winner_id")) if match.get("winner_id") else "",
+                "Status": match.get("status") or "",
+            }
+        )
+
     df = pd.DataFrame(rows)
-    return df.sort_values(["Data", "Horário", "Quadra"]) if not df.empty else df
+
+    if not df.empty:
+        df = df.sort_values(["Data", "Horário", "Quadra"], na_position="last")
+
+    return df
 
 
-def bracket_df(tid, cid):
+def bracket_df(tournament_id, category_id):
     rows = []
-    for m in matches(tid, cid):
-        rows.append({
-            "Fase": m.get("round_name") or "",
-            "Jogo": m["id"],
-            "Confronto": match_label(m),
-            "Data": m.get("scheduled_date") or "",
-            "Horário": m.get("scheduled_time") or "",
-            "Quadra": m.get("court") or "",
-            "Placar": m.get("score") or "",
-            "Vencedor": player_name(m.get("winner_id")) if m.get("winner_id") else "",
-            "Status": m.get("status") or "",
-        })
+
+    for match in get_matches(tournament_id, category_id):
+        rows.append(
+            {
+                "Fase": match.get("round_name") or "",
+                "Jogo": match["id"],
+                "Confronto": match_label(match),
+                "Data": match.get("scheduled_date") or "",
+                "Horário": match.get("scheduled_time") or "",
+                "Quadra": match.get("court") or "",
+                "Placar": match.get("score") or "",
+                "Vencedor": player_label(match.get("winner_id")) if match.get("winner_id") else "",
+                "Status": match.get("status") or "",
+            }
+        )
+
     return pd.DataFrame(rows)
 
 
+# ============================================================
+# COMPONENTES
+# ============================================================
+
+def tournament_selector(key):
+    tournaments = get_tournaments()
+
+    if not tournaments:
+        st.warning("Nenhum torneio cadastrado.")
+        return None
+
+    labels = {
+        f'{t["name"]} • {t["start_date"]} a {t["end_date"]}': t["id"]
+        for t in tournaments
+    }
+
+    selected = st.selectbox("Torneio", list(labels.keys()), key=key)
+    return labels[selected]
+
+
+def category_selector(tournament_id, key):
+    cats = get_categories(tournament_id)
+
+    if not cats:
+        st.warning("Nenhuma categoria cadastrada.")
+        return None
+
+    labels = {c["name"]: c["id"] for c in cats}
+    selected = st.selectbox("Categoria", list(labels.keys()), key=key)
+    return labels[selected]
+
+
+# ============================================================
+# ÁREA PÚBLICA
+# ============================================================
+
 def public_page():
-    tid = tournament_selector()
-    if not tid:
+    tournament_id = tournament_selector("public_tournament")
+    if not tournament_id:
         return
-    t = tournament(tid)
-    st.markdown(f"### {t['name']}")
-    ms, regs = matches(tid), registrations(tid)
-    done = [m for m in ms if m.get("status") in ["finalizado", "bye", "WO"]]
+
+    tournament = get_tournament(tournament_id)
+    st.subheader(tournament["name"])
+
+    regs = get_registrations(tournament_id)
+    matches = get_matches(tournament_id)
+    finished = [m for m in matches if m.get("status") in ["finalizado", "bye", "WO"]]
+
     c1, c2, c3 = st.columns(3)
-    c1.metric("Inscrições", len(regs)); c2.metric("Jogos criados", len(ms)); c3.metric("Finalizados/bye", len(done))
+    c1.metric("Inscritos", len(regs))
+    c2.metric("Jogos", len(matches))
+    c3.metric("Finalizados/bye", len(finished))
+
     tab1, tab2, tab3 = st.tabs(["Programação", "Chaves", "Inscritos"])
+
     with tab1:
-        df = schedule_df(tid)
-        st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("Programação ainda não gerada.")
+        df = schedule_df(tournament_id)
+        if df.empty:
+            st.info("Programação ainda não gerada.")
+        else:
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
     with tab2:
-        cid = category_selector(tid, "public_cat")
-        if cid:
-            df = bracket_df(tid, cid)
-            st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("Chave ainda não gerada.")
+        category_id = category_selector(tournament_id, "public_category")
+        if category_id:
+            df = bracket_df(tournament_id, category_id)
+            if df.empty:
+                st.info("Chave ainda não gerada para esta categoria.")
+            else:
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
     with tab3:
         rows = []
-        for r in regs:
-            p, c = player(r["player_id"]), category(r["category_id"])
-            rows.append({"Categoria": c.get("name", "") if c else "", "Atleta": p.get("name", "") if p else "", "Cidade": p.get("city", "") if p else "", "Origem": "Fora" if p and p.get("is_outside") else "Linhares"})
+        for reg in get_registrations(tournament_id):
+            p = reg.get("player") or {}
+            c = reg.get("category") or {}
+            rows.append(
+                {
+                    "Categoria": c.get("name", ""),
+                    "Atleta": p.get("name", ""),
+                    "Cidade": p.get("city", ""),
+                    "Origem": "Fora" if p.get("is_outside") else "Linhares",
+                }
+            )
+
         df = pd.DataFrame(rows)
-        st.dataframe(df.sort_values(["Categoria", "Atleta"]), use_container_width=True, hide_index=True) if not df.empty else st.info("Sem inscritos.")
+        if df.empty:
+            st.info("Nenhum inscrito.")
+        else:
+            st.dataframe(df.sort_values(["Categoria", "Atleta"]), use_container_width=True, hide_index=True)
 
 
-def admin_ok():
+# ============================================================
+# ADMIN
+# ============================================================
+
+def admin_login():
     if st.session_state.get("admin_ok"):
         return True
-    st.markdown("### Acesso administrativo")
-    pwd = st.text_input("Senha do admin", type="password")
+
+    st.subheader("Área administrativa")
+    password = st.text_input("Senha do admin", type="password")
+
     if st.button("Entrar"):
-        correct = get_secret("ADMIN_PASSWORD") or get_secret("ADMIN_TOKEN") or "1234"
-        if pwd == correct:
-            st.session_state.admin_ok = True
+        if password == ADMIN_PASSWORD:
+            st.session_state["admin_ok"] = True
+            st.success("Acesso liberado.")
             st.rerun()
         else:
             st.error("Senha incorreta.")
+
     return False
 
 
 def admin_tournaments():
-    st.markdown("### Criar torneio")
-    with st.form("create_t"):
-        name = st.text_input("Nome", "Open Teste Tênis Linhares")
-        a, b = st.columns(2)
-        start = a.date_input("Data inicial", date.today())
-        end = b.date_input("Data final", date.today() + timedelta(days=6))
-        if st.form_submit_button("Criar torneio"):
+    st.subheader("Criar torneio")
+
+    with st.form("new_tournament"):
+        name = st.text_input("Nome do torneio", value="Open Teste Tênis Linhares")
+
+        col1, col2 = st.columns(2)
+        start = col1.date_input("Data inicial", value=date.today())
+        end = col2.date_input("Data final", value=date.today() + timedelta(days=6))
+
+        submitted = st.form_submit_button("Criar torneio")
+
+        if submitted:
             if end < start:
-                st.error("Data final inválida.")
+                st.error("Data final não pode ser anterior à inicial.")
             else:
-                t = insert(TABLE_TOURNAMENTS, {"name": name.strip(), "start_date": start.isoformat(), "end_date": end.isoformat(), "active": True})
-                create_default_categories(t["id"])
-                st.success("Torneio criado."); st.rerun()
-    df = pd.DataFrame(tournaments())
-    st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("Nenhum torneio.")
+                tournament = insert_row(
+                    T_TOURNAMENTS,
+                    {
+                        "name": name.strip(),
+                        "start_date": start.isoformat(),
+                        "end_date": end.isoformat(),
+                        "active": True,
+                    },
+                )
+
+                if tournament:
+                    create_default_categories(tournament["id"])
+                    st.success("Torneio criado.")
+                    st.rerun()
+
+    df = pd.DataFrame(get_tournaments())
+    if not df.empty:
+        st.dataframe(
+            df[["id", "name", "start_date", "end_date", "active"]],
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
-def admin_categories(tid):
-    st.markdown("### Categorias")
-    with st.form("cat"):
-        a, b = st.columns([3, 1])
-        name = a.text_input("Nome da categoria")
-        limit = b.number_input("Limite", min_value=2, max_value=32, value=16)
-        if st.form_submit_button("Adicionar"):
-            insert(TABLE_CATEGORIES, {"tournament_id": tid, "name": name.strip(), "max_players": int(limit)})
-            st.success("Categoria adicionada."); st.rerun()
+def admin_categories(tournament_id):
+    st.subheader("Categorias")
+
+    with st.form("new_category"):
+        col1, col2 = st.columns([3, 1])
+        name = col1.text_input("Nova categoria")
+        limit = col2.number_input("Limite", min_value=2, max_value=32, value=16)
+        submitted = st.form_submit_button("Adicionar categoria")
+
+        if submitted:
+            if not name.strip():
+                st.error("Digite o nome da categoria.")
+            else:
+                insert_row(
+                    T_CATEGORIES,
+                    {
+                        "tournament_id": tournament_id,
+                        "name": name.strip(),
+                        "max_players": int(limit),
+                    },
+                )
+                st.success("Categoria adicionada.")
+                st.rerun()
+
     rows = []
-    for c in categories(tid):
-        rows.append({"id": c["id"], "Categoria": c["name"], "Limite": c["max_players"], "Inscritos": len(registrations(tid, c["id"]))})
+    for cat in get_categories(tournament_id):
+        rows.append(
+            {
+                "id": cat["id"],
+                "Categoria": cat["name"],
+                "Limite": cat["max_players"],
+                "Inscritos": len(get_registrations(tournament_id, cat["id"])),
+            }
+        )
+
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 def find_or_create_player(name, whatsapp, city, is_outside, unavailable):
     whatsapp = whatsapp.strip()
-    existing = []
-    if whatsapp:
-        existing = data(sb().table(TABLE_PLAYERS).select("*").eq("whatsapp", whatsapp).execute())
+    existing = get_player_by_whatsapp(whatsapp) if whatsapp else None
+
     if existing:
-        p = existing[0]
-        update_by_id(TABLE_PLAYERS, p["id"], {"name": name.strip(), "city": city.strip(), "is_outside": bool(is_outside), "unavailable": unavailable.strip()})
-        return p["id"]
-    p = insert(TABLE_PLAYERS, {"name": name.strip(), "whatsapp": whatsapp, "city": city.strip(), "is_outside": bool(is_outside), "unavailable": unavailable.strip()})
-    return p["id"]
+        update_row(
+            T_PLAYERS,
+            existing["id"],
+            {
+                "name": name.strip(),
+                "city": city.strip(),
+                "is_outside": bool(is_outside),
+                "unavailable": unavailable.strip(),
+            },
+        )
+        return existing["id"]
+
+    player = insert_row(
+        T_PLAYERS,
+        {
+            "name": name.strip(),
+            "whatsapp": whatsapp,
+            "city": city.strip(),
+            "is_outside": bool(is_outside),
+            "unavailable": unavailable.strip(),
+        },
+    )
+
+    return player["id"] if player else None
 
 
-def reg_exists(tid, cid, pid):
-    return bool(data(sb().table(TABLE_REGISTRATIONS).select("id").eq("tournament_id", tid).eq("category_id", cid).eq("player_id", pid).execute()))
+def admin_players(tournament_id):
+    st.subheader("Atletas e inscrições")
 
+    cats = get_categories(tournament_id)
+    cat_map = {c["name"]: c["id"] for c in cats}
 
-def admin_players(tid):
-    st.markdown("### Atletas/Inscrições")
-    cats = {c["name"]: c["id"] for c in categories(tid)}
-    with st.form("player_form"):
-        a, b = st.columns(2)
-        name = a.text_input("Nome do atleta")
-        whats = b.text_input("WhatsApp")
-        c, d = st.columns(2)
-        city = c.text_input("Cidade", "Linhares")
-        outside = d.checkbox("Atleta de fora de Linhares")
-        unavailable = st.text_area("Dias/horários que não pode jogar")
-        selected = st.multiselect("Categorias", list(cats.keys()))
-        if st.form_submit_button("Salvar inscrição"):
-            if not name.strip() or not selected:
-                st.error("Informe nome e categoria.")
+    with st.form("new_player"):
+        col1, col2 = st.columns(2)
+        name = col1.text_input("Nome do atleta")
+        whatsapp = col2.text_input("WhatsApp")
+
+        col3, col4 = st.columns(2)
+        city = col3.text_input("Cidade", value="Linhares")
+        is_outside = col4.checkbox("Atleta de fora de Linhares")
+
+        unavailable = st.text_area(
+            "Restrição de horário",
+            placeholder="Ex.: só chega sexta depois de 19h",
+        )
+
+        selected_categories = st.multiselect("Categorias", list(cat_map.keys()))
+
+        submitted = st.form_submit_button("Salvar inscrição")
+
+        if submitted:
+            if not name.strip():
+                st.error("Digite o nome do atleta.")
+            elif not selected_categories:
+                st.error("Selecione pelo menos uma categoria.")
             else:
-                pid = find_or_create_player(name, whats, city, outside, unavailable)
-                ok, errors = 0, []
-                for cname in selected:
-                    cid = cats[cname]
-                    cat = category(cid)
-                    if reg_exists(tid, cid, pid):
-                        errors.append(f"{cname}: já inscrito")
-                    elif len(registrations(tid, cid)) >= int(cat.get("max_players", 16)):
-                        errors.append(f"{cname}: cheia")
+                player_id = find_or_create_player(name, whatsapp, city, is_outside, unavailable)
+                saved = 0
+                warnings = []
+
+                for cat_name in selected_categories:
+                    category_id = cat_map[cat_name]
+                    cat = get_category(category_id)
+                    count = len(get_registrations(tournament_id, category_id))
+
+                    if registration_exists(tournament_id, category_id, player_id):
+                        warnings.append(f"{cat_name}: atleta já inscrito.")
+                    elif count >= int(cat.get("max_players", 16)):
+                        warnings.append(f"{cat_name}: categoria cheia.")
                     else:
-                        insert(TABLE_REGISTRATIONS, {"tournament_id": tid, "category_id": cid, "player_id": pid})
-                        ok += 1
-                if ok: st.success(f"{ok} inscrição(ões) salva(s).")
-                if errors: st.warning(" | ".join(errors))
+                        insert_row(
+                            T_REGISTRATIONS,
+                            {
+                                "tournament_id": tournament_id,
+                                "category_id": category_id,
+                                "player_id": player_id,
+                            },
+                        )
+                        saved += 1
+
+                if saved:
+                    st.success(f"{saved} inscrição(ões) salva(s).")
+                if warnings:
+                    st.warning(" | ".join(warnings))
+
                 st.rerun()
+
     rows = []
-    for r in registrations(tid):
-        p, c = player(r["player_id"]), category(r["category_id"])
-        rows.append({"Categoria": c.get("name", "") if c else "", "Atleta": p.get("name", "") if p else "", "WhatsApp": p.get("whatsapp", "") if p else "", "Cidade": p.get("city", "") if p else "", "Origem": "Fora" if p and p.get("is_outside") else "Linhares", "Indisponibilidade": p.get("unavailable", "") if p else ""})
+    for reg in get_registrations(tournament_id):
+        p = reg.get("player") or {}
+        c = reg.get("category") or {}
+
+        rows.append(
+            {
+                "Categoria": c.get("name", ""),
+                "Atleta": p.get("name", ""),
+                "WhatsApp": p.get("whatsapp", ""),
+                "Cidade": p.get("city", ""),
+                "Origem": "Fora" if p.get("is_outside") else "Linhares",
+                "Restrição": p.get("unavailable", ""),
+            }
+        )
+
     df = pd.DataFrame(rows)
-    st.dataframe(df.sort_values(["Categoria", "Atleta"]), use_container_width=True, hide_index=True) if not df.empty else st.info("Sem inscritos.")
+    if not df.empty:
+        st.dataframe(df.sort_values(["Categoria", "Atleta"]), use_container_width=True, hide_index=True)
+    else:
+        st.info("Nenhum atleta inscrito ainda.")
 
 
-def admin_brackets(tid):
-    st.markdown("### Chaves")
-    cid = category_selector(tid, "admin_cat")
-    if not cid: return
-    ps = registered_players(tid, cid)
-    st.caption(f"{len(ps)} atletas inscritos nesta categoria.")
-    if len(ps) < 2:
-        st.warning("Cadastre pelo menos 2 atletas."); return
-    a, b, c = st.columns(3)
-    if a.button("Sortear chave", use_container_width=True):
-        ids = [p["id"] for p in ps]; random.shuffle(ids); generate_bracket(tid, cid, ids); st.success("Chave sorteada."); st.rerun()
-    if b.button("Apagar chave", use_container_width=True):
-        delete_category_matches(tid, cid); st.warning("Chave apagada."); st.rerun()
-    if c.button("Atualizar avanço", use_container_width=True):
-        refresh_bracket(tid, cid); st.success("Atualizada."); st.rerun()
-    opts = {p["name"]: p["id"] for p in ps}
-    order_text = st.text_area("Ordem manual dos atletas", "\n".join(opts.keys()), height=220)
+def admin_brackets(tournament_id):
+    st.subheader("Chaves")
+
+    category_id = category_selector(tournament_id, "admin_bracket_cat")
+    if not category_id:
+        return
+
+    players = registered_players(tournament_id, category_id)
+    st.caption(f"{len(players)} atleta(s) inscritos nesta categoria.")
+
+    if len(players) < 2:
+        st.warning("Cadastre pelo menos 2 atletas.")
+        return
+
+    name_to_id = {p["name"]: p["id"] for p in players}
+
+    col1, col2, col3 = st.columns(3)
+
+    if col1.button("Sortear chave", use_container_width=True):
+        player_ids = [p["id"] for p in players]
+        random.shuffle(player_ids)
+        generate_bracket(tournament_id, category_id, player_ids)
+        st.success("Chave sorteada.")
+        st.rerun()
+
+    if col2.button("Apagar chave", use_container_width=True):
+        delete_matches_by_category(tournament_id, category_id)
+        st.warning("Chave apagada.")
+        st.rerun()
+
+    if col3.button("Atualizar avanço", use_container_width=True):
+        refresh_bracket(tournament_id, category_id)
+        st.success("Avanço atualizado.")
+        st.rerun()
+
+    st.markdown("#### Chave manual")
+    st.caption("Coloque um atleta por linha. O sistema cria 1x2, 3x4, 5x6...")
+
+    manual_order = st.text_area(
+        "Ordem dos atletas",
+        value="\n".join([p["name"] for p in players]),
+        height=220,
+    )
+
     if st.button("Gerar chave manual"):
-        names = [x.strip() for x in order_text.splitlines() if x.strip()]
-        unknown = [n for n in names if n not in opts]
-        if unknown: st.error("Nomes não encontrados: " + ", ".join(unknown))
+        names = [x.strip() for x in manual_order.splitlines() if x.strip()]
+        unknown = [name for name in names if name not in name_to_id]
+
+        if unknown:
+            st.error("Nomes não encontrados: " + ", ".join(unknown))
         else:
-            ids = [opts[n] for n in names] + [p["id"] for p in ps if p["id"] not in [opts[n] for n in names]]
-            generate_bracket(tid, cid, ids); st.success("Chave manual gerada."); st.rerun()
-    df = bracket_df(tid, cid)
-    st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("Chave ainda não gerada.")
+            ordered_ids = [name_to_id[name] for name in names]
+            missing = [p["id"] for p in players if p["id"] not in ordered_ids]
+            generate_bracket(tournament_id, category_id, ordered_ids + missing)
+            st.success("Chave manual gerada.")
+            st.rerun()
+
+    df = bracket_df(tournament_id, category_id)
+    if not df.empty:
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
 
-def admin_schedule(tid):
-    st.markdown("### Programação")
-    st.info("Regra: 3 quadras, jogos de 1h30, seg-qui 16:00/17:30/19:00/20:30, sexta 15:30/17:00/18:30/20:00/21:30.")
-    include_weekend = st.checkbox("Incluir sábado/domingo", value=True)
-    a, b = st.columns(2)
-    if a.button("Gerar programação automática", use_container_width=True):
-        total, pending = generate_schedule(tid, include_weekend)
-        st.success(f"{total} jogos agendados." if pending == 0 else f"{total} jogos agendados e {pending} sem horário."); st.rerun()
-    if b.button("Limpar programação", use_container_width=True):
-        clear_schedule(tid); st.warning("Programação limpa."); st.rerun()
-    df = schedule_df(tid)
-    st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("Sem programação.")
+def admin_schedule(tournament_id):
+    st.subheader("Programação automática")
+    st.info(
+        "Regra: 3 quadras, jogos de 1h30, seg-qui 16:00/17:30/19:00/20:30, sexta 15:30/17:00/18:30/20:00/21:30."
+    )
 
-    st.markdown("#### Editar manualmente")
-    ms = matches(tid)
-    if ms:
-        labels = {f"Jogo {m['id']} • {category_name(m['category_id'])} • {m['round_name']} • {match_label(m)}": m["id"] for m in ms}
-        mid = labels[st.selectbox("Jogo", list(labels.keys()))]
-        m = select_by_id(TABLE_MATCHES, mid)
-        x, y, z = st.columns(3)
-        default_date = datetime.strptime(m["scheduled_date"], "%Y-%m-%d").date() if m.get("scheduled_date") else date.today()
-        nd = x.date_input("Data", default_date)
-        nt = y.text_input("Horário", m.get("scheduled_time") or "18:00")
-        nc = z.number_input("Quadra", min_value=1, max_value=3, value=int(m.get("court") or 1))
+    include_weekend = st.checkbox("Incluir sábado e domingo", value=True)
+
+    col1, col2 = st.columns(2)
+
+    if col1.button("Gerar programação automática", use_container_width=True):
+        scheduled, pending = generate_schedule(tournament_id, include_weekend)
+        if pending:
+            st.warning(f"{scheduled} jogos agendados e {pending} ficaram sem horário.")
+        else:
+            st.success(f"{scheduled} jogos agendados.")
+        st.rerun()
+
+    if col2.button("Limpar programação", use_container_width=True):
+        clear_schedule(tournament_id)
+        st.warning("Programação apagada.")
+        st.rerun()
+
+    df = schedule_df(tournament_id)
+    if not df.empty:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Editar jogo manualmente")
+
+    matches = get_matches(tournament_id)
+
+    if matches:
+        labels = {
+            f'Jogo {m["id"]} • {category_label(m["category_id"])} • {match_label(m)}': m["id"]
+            for m in matches
+        }
+
+        selected = st.selectbox("Jogo", list(labels.keys()))
+        match_id = labels[selected]
+        match = get_match(match_id)
+
+        col1, col2, col3 = st.columns(3)
+
+        default_date = (
+            datetime.strptime(match["scheduled_date"], "%Y-%m-%d").date()
+            if match.get("scheduled_date")
+            else date.today()
+        )
+
+        new_date = col1.date_input("Data", value=default_date)
+        new_time = col2.text_input("Horário", value=match.get("scheduled_time") or "18:00")
+        new_court = col3.number_input("Quadra", min_value=1, max_value=3, value=int(match.get("court") or 1))
+
         if st.button("Salvar edição"):
-            update_by_id(TABLE_MATCHES, mid, {"scheduled_date": nd.isoformat(), "scheduled_time": nt.strip(), "court": int(nc)})
-            st.success("Jogo atualizado."); st.rerun()
+            update_row(
+                T_MATCHES,
+                match_id,
+                {
+                    "scheduled_date": new_date.isoformat(),
+                    "scheduled_time": new_time.strip(),
+                    "court": int(new_court),
+                },
+            )
+            st.success("Jogo atualizado.")
+            st.rerun()
 
 
-def admin_results(tid):
-    st.markdown("### Resultados")
-    ms = matches(tid)
-    if not ms:
-        st.info("Gere uma chave primeiro."); return
-    for m in ms:
-        with st.expander(f"Jogo {m['id']} • {category_name(m['category_id'])} • {m['round_name']} • {match_label(m)}"):
-            st.write(f"Status: **{m.get('status')}**")
+def admin_results(tournament_id):
+    st.subheader("Resultados")
+
+    matches = get_matches(tournament_id)
+
+    if not matches:
+        st.info("Nenhuma chave gerada.")
+        return
+
+    for match in matches:
+        with st.expander(
+            f'Jogo {match["id"]} • {category_label(match["category_id"])} • {match["round_name"]} • {match_label(match)}'
+        ):
+            st.write(f"Status: **{match.get('status')}**")
+
+            if match.get("scheduled_date"):
+                st.write(
+                    f"Programado: **{match['scheduled_date']} às {match['scheduled_time']} • Quadra {match['court']}**"
+                )
+
             options = []
-            if m.get("player1_id"): options.append((player_name(m["player1_id"]), m["player1_id"]))
-            if m.get("player2_id"): options.append((player_name(m["player2_id"]), m["player2_id"]))
-            score = st.text_input("Placar", value=m.get("score") or "", key=f"score_{m['id']}")
+
+            if match.get("player1_id"):
+                options.append((player_label(match["player1_id"]), match["player1_id"]))
+
+            if match.get("player2_id"):
+                options.append((player_label(match["player2_id"]), match["player2_id"]))
+
             if not options:
-                st.info("Aguardando atletas."); continue
-            labels = [o[0] for o in options]
-            winner = dict(options)[st.selectbox("Vencedor", labels, key=f"win_{m['id']}")]
-            a, b = st.columns(2)
-            if a.button("Salvar resultado", key=f"save_{m['id']}", use_container_width=True):
-                update_by_id(TABLE_MATCHES, m["id"], {"winner_id": winner, "score": score.strip(), "status": "finalizado"})
-                refresh_bracket(tid, m["category_id"]); st.success("Resultado salvo e vencedor avançado."); st.rerun()
-            if b.button("WO para vencedor", key=f"wo_{m['id']}", use_container_width=True):
-                update_by_id(TABLE_MATCHES, m["id"], {"winner_id": winner, "score": "WO", "status": "WO"})
-                refresh_bracket(tid, m["category_id"]); st.success("WO salvo."); st.rerun()
+                st.info("Aguardando definição dos atletas.")
+                continue
+
+            score = st.text_input("Placar", value=match.get("score") or "", key=f"score_{match['id']}")
+            selected = st.selectbox("Vencedor", [x[0] for x in options], key=f"winner_{match['id']}")
+            winner_id = dict(options)[selected]
+
+            col1, col2 = st.columns(2)
+
+            if col1.button("Salvar resultado", key=f"save_{match['id']}", use_container_width=True):
+                update_row(
+                    T_MATCHES,
+                    match["id"],
+                    {
+                        "winner_id": winner_id,
+                        "score": score.strip(),
+                        "status": "finalizado",
+                    },
+                )
+                refresh_bracket(tournament_id, match["category_id"])
+                st.success("Resultado salvo. Vencedor avançou automaticamente.")
+                st.rerun()
+
+            if col2.button("WO para vencedor selecionado", key=f"wo_{match['id']}", use_container_width=True):
+                update_row(
+                    T_MATCHES,
+                    match["id"],
+                    {
+                        "winner_id": winner_id,
+                        "score": "WO",
+                        "status": "WO",
+                    },
+                )
+                refresh_bracket(tournament_id, match["category_id"])
+                st.success("WO salvo.")
+                st.rerun()
 
 
 def admin_page():
-    if not admin_ok(): return
-    tid = tournament_selector()
-    tabs = st.tabs(["Torneios", "Categorias", "Atletas", "Chaves", "Programação", "Resultados"])
-    with tabs[0]: admin_tournaments()
-    if tid:
-        with tabs[1]: admin_categories(tid)
-        with tabs[2]: admin_players(tid)
-        with tabs[3]: admin_brackets(tid)
-        with tabs[4]: admin_schedule(tid)
-        with tabs[5]: admin_results(tid)
+    if not admin_login():
+        return
 
+    tournament_id = tournament_selector("admin_tournament")
+
+    tabs = st.tabs(["Torneios", "Categorias", "Atletas", "Chaves", "Programação", "Resultados"])
+
+    with tabs[0]:
+        admin_tournaments()
+
+    if tournament_id:
+        with tabs[1]:
+            admin_categories(tournament_id)
+        with tabs[2]:
+            admin_players(tournament_id)
+        with tabs[3]:
+            admin_brackets(tournament_id)
+        with tabs[4]:
+            admin_schedule(tournament_id)
+        with tabs[5]:
+            admin_results(tournament_id)
+
+
+# ============================================================
+# APP
+# ============================================================
 
 def main():
-    st.set_page_config(page_title="Tênis Linhares • Torneios Supabase", page_icon="🎾", layout="wide")
-    apply_css(); header(); seed_if_empty()
-    mode = st.sidebar.radio("Menu", ["Área pública", "Admin"])
-    st.sidebar.caption("App teste separado. Só usa tabelas tl_* no Supabase.")
-    public_page() if mode == "Área pública" else admin_page()
+    st.set_page_config(
+        page_title="Tênis Linhares • Torneios",
+        page_icon="🎾",
+        layout="wide",
+    )
+
+    apply_css()
+    header()
+
+    try:
+        seed_if_empty()
+    except Exception as exc:
+        st.error("Erro ao conectar no Supabase ou carregar tabelas.")
+        st.code(str(exc))
+        st.stop()
+
+    menu = st.sidebar.radio("Menu", ["Área pública", "Admin"])
+    st.sidebar.caption("App teste separado do site oficial.")
+
+    if menu == "Área pública":
+        public_page()
+    else:
+        admin_page()
 
 
 if __name__ == "__main__":
