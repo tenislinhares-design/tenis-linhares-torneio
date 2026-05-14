@@ -6,7 +6,9 @@ import re
 import io
 import csv
 import unicodedata
+import html
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -788,6 +790,47 @@ def generate_bracket_from_slots(tournament_id, category_id, slots):
     refresh_bracket(tournament_id, category_id)
 
 
+
+# ============================================================
+# PUBLICAÇÃO / TRAVAS DA ÁREA PÚBLICA
+# ============================================================
+
+def is_schedule_published(tournament):
+    return bool(tournament.get("schedule_published"))
+
+
+def is_results_public(tournament):
+    return bool(tournament.get("results_public"))
+
+
+def is_bracket_published(category):
+    return bool(category.get("bracket_published"))
+
+
+def publish_schedule(tournament_id, publish=True):
+    update_row(T_TOURNAMENTS, tournament_id, {"schedule_published": bool(publish)})
+
+
+def publish_results(tournament_id, publish=True):
+    update_row(T_TOURNAMENTS, tournament_id, {"results_public": bool(publish)})
+
+
+def publish_category_bracket(category_id, publish=True):
+    update_row(T_CATEGORIES, category_id, {"bracket_published": bool(publish)})
+
+
+def publish_all_brackets(tournament_id, publish=True):
+    updated = 0
+    for cat in categories_with_brackets(tournament_id):
+        publish_category_bracket(cat["id"], publish)
+        updated += 1
+    return updated
+
+
+def public_categories_with_brackets(tournament_id):
+    cats = categories_with_brackets(tournament_id)
+    return [cat for cat in cats if is_bracket_published(cat)]
+
 # ============================================================
 # VISUAL
 # ============================================================
@@ -876,6 +919,7 @@ def create_default_categories(tournament_id):
                     "tournament_id": tournament_id,
                     "name": name,
                     "max_players": 16,
+                    "bracket_published": False,
                 },
             )
 
@@ -891,6 +935,8 @@ def seed_if_empty():
             "start_date": date.today().isoformat(),
             "end_date": (date.today() + timedelta(days=6)).isoformat(),
             "active": True,
+            "schedule_published": False,
+            "results_public": False,
         },
     )
     if tournament:
@@ -1169,6 +1215,13 @@ def clear_schedule(tournament_id):
         .eq("tournament_id", tournament_id)
     )
 
+    # Trava pública: ao apagar programação, ela some da área pública automaticamente.
+    try:
+        publish_schedule(tournament_id, False)
+        publish_results(tournament_id, False)
+    except Exception:
+        pass
+
 
 def possible_players_for_match_local(match, matches_by_id, cache):
     """
@@ -1423,13 +1476,24 @@ def weekday_pt(date_text):
     return names.get(d.weekday(), "")
 
 
-def render_schedule_by_day(df):
+def today_sao_paulo():
+    return datetime.now(ZoneInfo("America/Sao_Paulo")).date().isoformat()
+
+
+def render_schedule_by_day(df, show_results=True):
     if df.empty:
         st.info("Programação ainda não gerada.")
         return
 
     scheduled = df[df["Data"].astype(str).str.len() > 0].copy()
     unscheduled = df[df["Data"].astype(str).str.len() == 0].copy()
+
+    base_columns = ["Horário", "Quadra", "Categoria", "Fase", "Jogo", "Confronto"]
+    result_columns = ["Placar", "Vencedor", "Status"]
+    display_columns = [col for col in base_columns if col in df.columns]
+
+    if show_results:
+        display_columns += [col for col in result_columns if col in df.columns]
 
     if scheduled.empty:
         st.info("Ainda não há jogos com data/horário.")
@@ -1438,24 +1502,14 @@ def render_schedule_by_day(df):
             day_df = scheduled[scheduled["Data"] == day].sort_values(["Horário", "Quadra"])
             st.markdown(f"### {weekday_pt(day)} — {day}")
             st.dataframe(
-                day_df[
-                    [
-                        "Horário",
-                        "Quadra",
-                        "Categoria",
-                        "Fase",
-                        "Jogo",
-                        "Confronto",
-                        "Placar",
-                        "Vencedor",
-                        "Status",
-                    ]
-                ],
+                day_df[display_columns],
                 use_container_width=True,
                 hide_index=True,
             )
 
-    if not unscheduled.empty:
+    if not unscheduled.empty and not show_results:
+        st.info("Alguns jogos ainda aguardam data/horário pela organização.")
+    elif not unscheduled.empty:
         with st.expander("Jogos sem horário", expanded=False):
             st.dataframe(unscheduled, use_container_width=True, hide_index=True)
 
@@ -1481,121 +1535,314 @@ def bracket_df(tournament_id, category_id):
     return pd.DataFrame(rows)
 
 
-def render_bracket_visual(tournament_id, category_id):
+def bracket_layout(tournament_id, category_id, public_view=False, show_results=True):
     matches = get_matches(tournament_id, category_id)
-    if not matches:
-        st.info("Chave ainda não gerada.")
-        return
 
     rounds = {}
     for match in matches:
         rounds.setdefault(match.get("round_num", 1), []).append(match)
 
+    if not rounds:
+        return None
+
+    for round_num in rounds:
+        rounds[round_num] = sorted(rounds[round_num], key=lambda m: m.get("position", 0))
+
+    first_count = max(len(rounds.get(1, [])), 1)
+    box_w = 260
+    box_h = 76
+    round_gap = 110
+    row_gap = 26
+    margin_x = 28
+    margin_y = 30
+
+    centers = {}
+    boxes = []
+    connectors = []
+
+    # Primeira rodada: posições fixas.
+    for idx, match in enumerate(rounds.get(1, [])):
+        y = margin_y + idx * (box_h + row_gap)
+        x = margin_x
+        centers[match["id"]] = (x + box_w, y + box_h / 2)
+        boxes.append((match, x, y, box_w, box_h))
+
+    # Rodadas seguintes: ficam centralizadas entre os jogos de origem.
+    for round_num in sorted(rounds.keys()):
+        if round_num == 1:
+            continue
+
+        x = margin_x + (round_num - 1) * (box_w + round_gap)
+
+        for idx, match in enumerate(rounds[round_num]):
+            y = None
+
+            s1 = match.get("source1_match_id")
+            s2 = match.get("source2_match_id")
+
+            if s1 in centers and s2 in centers:
+                y = ((centers[s1][1] + centers[s2][1]) / 2) - (box_h / 2)
+            elif s1 in centers:
+                y = centers[s1][1] - (box_h / 2)
+            elif s2 in centers:
+                y = centers[s2][1] - (box_h / 2)
+            else:
+                # Fallback: distribui de forma proporcional.
+                divisor = max(len(rounds[round_num]), 1)
+                y = margin_y + idx * max((first_count * (box_h + row_gap)) / divisor, box_h + row_gap)
+
+            centers[match["id"]] = (x + box_w, y + box_h / 2)
+            boxes.append((match, x, y, box_w, box_h))
+
+            target_left = (x, y + box_h / 2)
+            for source_id in [s1, s2]:
+                if source_id in centers:
+                    source_right = centers[source_id]
+                    mid_x = (source_right[0] + target_left[0]) / 2
+                    connectors.append(
+                        {
+                            "source": source_right,
+                            "target": target_left,
+                            "mid_x": mid_x,
+                        }
+                    )
+
+    total_rounds = max(rounds.keys())
+    width = margin_x * 2 + total_rounds * box_w + (total_rounds - 1) * round_gap
+    height = max(margin_y * 2 + first_count * (box_h + row_gap), 260)
+
+    return {
+        "matches": matches,
+        "rounds": rounds,
+        "boxes": boxes,
+        "connectors": connectors,
+        "width": width,
+        "height": height,
+        "box_w": box_w,
+        "box_h": box_h,
+        "round_gap": round_gap,
+        "margin_x": margin_x,
+        "margin_y": margin_y,
+        "public_view": public_view,
+        "show_results": show_results,
+    }
+
+
+def safe_svg_text(text, limit=34):
+    value = html.escape(str(text or ""))
+    if len(value) > limit:
+        return value[: limit - 3] + "..."
+    return value
+
+
+def player_display_for_match(match, slot, public_view=False):
+    if slot == 1:
+        player_id = match.get("player1_id")
+        source_id = match.get("source1_match_id")
+    else:
+        player_id = match.get("player2_id")
+        source_id = match.get("source2_match_id")
+
+    if player_id:
+        p = get_player(player_id)
+        if p:
+            return p.get("name", "Atleta")
+
+    if source_id:
+        return f"Vencedor Jogo {source_id}"
+
+    return "Aguardando"
+
+
+def build_bracket_svg(tournament_id, category_id, public_view=False, show_results=True):
+    layout = bracket_layout(tournament_id, category_id, public_view=public_view, show_results=show_results)
+    if not layout:
+        return ""
+
+    category = get_category(category_id)
+    title = category.get("name", "Chave") if category else "Chave"
+
+    width = int(layout["width"])
+    height = int(layout["height"] + 45)
+
+    svg = []
+    svg.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">')
+    svg.append('<rect width="100%" height="100%" fill="#101815"/>')
+    svg.append(f'<text x="24" y="28" fill="#CCFF00" font-family="Arial" font-size="20" font-weight="800">{safe_svg_text(title, 80)}</text>')
+
+    # Conectores
+    for connector in layout["connectors"]:
+        sx, sy = connector["source"]
+        tx, ty = connector["target"]
+        mx = connector["mid_x"]
+        sy += 45
+        ty += 45
+        svg.append(
+            f'<path d="M {sx:.1f} {sy:.1f} H {mx:.1f} V {ty:.1f} H {tx:.1f}" '
+            f'fill="none" stroke="#CCFF00" stroke-opacity="0.55" stroke-width="2"/>'
+        )
+
+    # Títulos das rodadas
+    round_titles_drawn = set()
+    for match, x, y, box_w, box_h in layout["boxes"]:
+        round_num = match.get("round_num", 1)
+        if round_num not in round_titles_drawn:
+            svg.append(
+                f'<text x="{x:.1f}" y="64" fill="#CCFF00" font-family="Arial" font-size="15" font-weight="800">'
+                f'{safe_svg_text(match.get("round_name", f"Rodada {round_num}"), 32)}</text>'
+            )
+            round_titles_drawn.add(round_num)
+
+    # Caixas
+    for match, x, y, box_w, box_h in layout["boxes"]:
+        y += 45
+        p1 = player_display_for_match(match, 1, public_view)
+        p2 = player_display_for_match(match, 2, public_view)
+        winner_id = match.get("winner_id") if show_results else None
+
+        p1_fill = "#CCFF00" if winner_id and winner_id == match.get("player1_id") else "#F6FFF3"
+        p2_fill = "#CCFF00" if winner_id and winner_id == match.get("player2_id") else "#F6FFF3"
+
+        meta = f'Jogo {match["id"]}'
+        if match.get("scheduled_date"):
+            meta += f' - {match["scheduled_date"]} {match.get("scheduled_time","")} Q{match.get("court","")}'
+
+        score = match.get("score") or ""
+        if not show_results:
+            score = ""
+
+        svg.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{box_w}" height="{box_h}" rx="14" fill="#1c2521" stroke="#CCFF00" stroke-opacity="0.42" stroke-width="1.4"/>')
+        svg.append(f'<line x1="{x+12:.1f}" y1="{y+38:.1f}" x2="{x+box_w-12:.1f}" y2="{y+38:.1f}" stroke="#FFFFFF" stroke-opacity="0.15"/>')
+
+        svg.append(f'<text x="{x+14:.1f}" y="{y+25:.1f}" fill="{p1_fill}" font-family="Arial" font-size="14" font-weight="700">{safe_svg_text(p1)}</text>')
+        svg.append(f'<text x="{x+14:.1f}" y="{y+57:.1f}" fill="{p2_fill}" font-family="Arial" font-size="14" font-weight="700">{safe_svg_text(p2)}</text>')
+
+        if score and show_results:
+            svg.append(f'<text x="{x+box_w-14:.1f}" y="{y+25:.1f}" fill="#CCFF00" text-anchor="end" font-family="Arial" font-size="11" font-weight="700">{safe_svg_text(score, 16)}</text>')
+
+        svg.append(f'<text x="{x+14:.1f}" y="{y+box_h-7:.1f}" fill="#B8C7B8" font-family="Arial" font-size="10">{safe_svg_text(meta, 42)}</text>')
+
+    svg.append("</svg>")
+    return "".join(svg)
+
+
+def render_bracket_visual(tournament_id, category_id, public_view=False, show_results=True):
+    if not get_matches(tournament_id, category_id):
+        st.info("Chave ainda não gerada.")
+        return
+
+    svg = build_bracket_svg(tournament_id, category_id, public_view=public_view, show_results=show_results)
+    if not svg:
+        st.info("Chave ainda não gerada.")
+        return
+
     st.markdown(
-        """
-        <style>
-        .tl-bracket-wrap {
-            overflow-x: auto;
-            padding-bottom: 14px;
-        }
-        .tl-bracket {
-            display: flex;
-            gap: 22px;
-            align-items: stretch;
-            min-width: 900px;
-        }
-        .tl-round {
-            min-width: 240px;
-            display: flex;
-            flex-direction: column;
-            justify-content: space-around;
-            gap: 14px;
-        }
-        .tl-round-title {
-            color: #CCFF00;
-            font-weight: 900;
-            margin-bottom: 8px;
-            text-align: center;
-            border-bottom: 1px solid rgba(204,255,0,.25);
-            padding-bottom: 6px;
-        }
-        .tl-match-box {
-            position: relative;
-            background: rgba(21,28,24,.96);
-            border: 1px solid rgba(204,255,0,.30);
-            border-radius: 14px;
-            padding: 10px;
-            box-shadow: 0 8px 18px rgba(0,0,0,.22);
-        }
-        .tl-match-box:after {
-            content: "";
-            position: absolute;
-            right: -14px;
-            top: 50%;
-            width: 14px;
-            border-top: 1px solid rgba(204,255,0,.35);
-        }
-        .tl-player-row {
-            display: flex;
-            justify-content: space-between;
-            border-bottom: 1px solid rgba(255,255,255,.08);
-            padding: 4px 0;
-            color: #f5fff2;
-            font-size: 13px;
-        }
-        .tl-player-row:last-child {
-            border-bottom: none;
-        }
-        .tl-match-meta {
-            color: #b8c7b8;
-            font-size: 11px;
-            margin-top: 5px;
-        }
-        .tl-winner {
-            color: #CCFF00;
-            font-weight: 800;
-        }
-        </style>
+        f"""
+        <div style="overflow-x:auto; border:1px solid rgba(204,255,0,.18); border-radius:18px; background:#101815; padding:10px;">
+            {svg}
+        </div>
         """,
         unsafe_allow_html=True,
     )
 
-    html = ['<div class="tl-bracket-wrap"><div class="tl-bracket">']
 
-    for round_num in sorted(rounds):
-        round_matches = sorted(rounds[round_num], key=lambda m: m.get("position", 0))
-        round_title = round_matches[0].get("round_name", f"Rodada {round_num}") if round_matches else f"Rodada {round_num}"
-        html.append('<div class="tl-round">')
-        html.append(f'<div class="tl-round-title">{round_title}</div>')
+def bracket_pdf_bytes(tournament_id, category_id, public_view=False, show_results=True):
+    layout = bracket_layout(tournament_id, category_id, public_view=public_view, show_results=show_results)
+    if not layout:
+        return b""
 
-        for match in round_matches:
-            p1 = player_label(match.get("player1_id"))
-            p2 = player_label(match.get("player2_id"))
+    try:
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.pagesizes import landscape, A4
+        from reportlab.lib.colors import HexColor
+    except Exception as exc:
+        st.error("Biblioteca de PDF não instalada. Confira se 'reportlab' está no requirements.txt.")
+        st.code(str(exc))
+        return b""
 
-            if not match.get("player1_id") and match.get("source1_match_id"):
-                p1 = f'Vencedor Jogo {match["source1_match_id"]}'
-            if not match.get("player2_id") and match.get("source2_match_id"):
-                p2 = f'Vencedor Jogo {match["source2_match_id"]}'
+    buffer = io.BytesIO()
+    page_w, page_h = landscape(A4)
+    c = canvas.Canvas(buffer, pagesize=landscape(A4))
 
-            winner = player_label(match.get("winner_id")) if match.get("winner_id") else ""
-            score = match.get("score") or ""
+    category = get_category(category_id)
+    title = category.get("name", "Chave") if category else "Chave"
 
-            p1_class = "tl-player-row tl-winner" if match.get("winner_id") and match.get("winner_id") == match.get("player1_id") else "tl-player-row"
-            p2_class = "tl-player-row tl-winner" if match.get("winner_id") and match.get("winner_id") == match.get("player2_id") else "tl-player-row"
+    layout_w = layout["width"]
+    layout_h = layout["height"] + 50
 
-            html.append('<div class="tl-match-box">')
-            html.append(f'<div class="{p1_class}"><span>{p1}</span><span>{score if winner == p1 else ""}</span></div>')
-            html.append(f'<div class="{p2_class}"><span>{p2}</span><span>{score if winner == p2 else ""}</span></div>')
-            meta = f'Jogo {match["id"]}'
-            if match.get("scheduled_date"):
-                meta += f' - {match["scheduled_date"]} {match.get("scheduled_time","")} Q{match.get("court","")}'
-            html.append(f'<div class="tl-match-meta">{meta}</div>')
-            html.append('</div>')
+    scale = min((page_w - 32) / layout_w, (page_h - 44) / layout_h, 1.0)
+    ox = 16
+    oy = page_h - 26
 
-        html.append('</div>')
+    c.setFillColor(HexColor("#101815"))
+    c.rect(0, 0, page_w, page_h, fill=1, stroke=0)
 
-    html.append("</div></div>")
-    st.markdown("".join(html), unsafe_allow_html=True)
+    c.setFillColor(HexColor("#CCFF00"))
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(ox, page_h - 22, title[:80])
+
+    def tx(x):
+        return ox + x * scale
+
+    def ty(y):
+        return oy - (y + 45) * scale
+
+    # Conectores
+    c.setStrokeColor(HexColor("#CCFF00"))
+    c.setLineWidth(1.2)
+    for connector in layout["connectors"]:
+        sx, sy = connector["source"]
+        tx0, ty0 = connector["target"]
+        mx = connector["mid_x"]
+
+        sy += 45
+        ty0 += 45
+
+        c.line(tx(sx), ty(sy), tx(mx), ty(sy))
+        c.line(tx(mx), ty(sy), tx(mx), ty(ty0))
+        c.line(tx(mx), ty(ty0), tx(tx0), ty(ty0))
+
+    # Títulos rodadas
+    drawn = set()
+    c.setFillColor(HexColor("#CCFF00"))
+    c.setFont("Helvetica-Bold", max(7, 12 * scale))
+    for match, x, y, box_w, box_h in layout["boxes"]:
+        round_num = match.get("round_num", 1)
+        if round_num not in drawn:
+            c.drawString(tx(x), ty(18), str(match.get("round_name", f"Rodada {round_num}"))[:28])
+            drawn.add(round_num)
+
+    # Boxes
+    for match, x, y, box_w, box_h in layout["boxes"]:
+        y += 45
+
+        c.setStrokeColor(HexColor("#CCFF00"))
+        c.setFillColor(HexColor("#1c2521"))
+        c.roundRect(tx(x), ty(y + box_h), box_w * scale, box_h * scale, 8 * scale, fill=1, stroke=1)
+
+        p1 = player_display_for_match(match, 1, public_view)
+        p2 = player_display_for_match(match, 2, public_view)
+
+        winner_id = match.get("winner_id") if show_results else None
+        c.setFont("Helvetica-Bold", max(6, 9 * scale))
+
+        c.setFillColor(HexColor("#CCFF00") if winner_id and winner_id == match.get("player1_id") else HexColor("#F6FFF3"))
+        c.drawString(tx(x + 10), ty(y + 20), str(p1)[:30])
+
+        c.setFillColor(HexColor("#CCFF00") if winner_id and winner_id == match.get("player2_id") else HexColor("#F6FFF3"))
+        c.drawString(tx(x + 10), ty(y + 50), str(p2)[:30])
+
+        c.setFillColor(HexColor("#B8C7B8"))
+        c.setFont("Helvetica", max(5, 7 * scale))
+        meta = f'Jogo {match["id"]}'
+        if match.get("scheduled_date"):
+            meta += f' - {match["scheduled_date"]} {match.get("scheduled_time","")} Q{match.get("court","")}'
+        c.drawString(tx(x + 10), ty(y + box_h - 6), meta[:44])
+
+    c.showPage()
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 def build_pdf_table(title, rows, columns, filename_hint="documento"):
@@ -1646,20 +1893,20 @@ def build_pdf_table(title, rows, columns, filename_hint="documento"):
     return buffer.getvalue()
 
 
-def bracket_pdf_bytes(tournament_id, category_id):
-    tournament = get_tournament(tournament_id)
-    category = get_category(category_id)
-    rows = bracket_df(tournament_id, category_id).to_dict("records")
-    columns = ["Fase", "Jogo", "Confronto", "Data", "Horário", "Quadra", "Placar", "Vencedor", "Status"]
-    title = f'{tournament.get("name", "Torneio")} - {category.get("name", "Categoria")} - Chave'
-    return build_pdf_table(title, rows, columns)
-
 
 def schedule_pdf_bytes(tournament_id):
     tournament = get_tournament(tournament_id)
     rows = schedule_df(tournament_id).to_dict("records")
     columns = ["Data", "Horário", "Quadra", "Categoria", "Fase", "Jogo", "Confronto", "Placar", "Vencedor", "Status"]
     title = f'{tournament.get("name", "Torneio")} - Programação Completa'
+    return build_pdf_table(title, rows, columns)
+
+
+def public_schedule_pdf_bytes(tournament_id):
+    tournament = get_tournament(tournament_id)
+    rows = schedule_df(tournament_id).to_dict("records")
+    columns = ["Data", "Horário", "Quadra", "Categoria", "Fase", "Jogo", "Confronto"]
+    title = f'{tournament.get("name", "Torneio")} - Programação'
     return build_pdf_table(title, rows, columns)
 
 
@@ -1707,109 +1954,92 @@ def public_page():
     tournament = get_tournament(tournament_id)
     st.subheader(tournament["name"])
 
-    regs = get_registrations(tournament_id)
-    matches = get_matches(tournament_id)
-    finished = [m for m in matches if m.get("status") in ["finalizado", "bye", "WO"]]
+    st.caption("Área pública do torneio: programação diária e chaves publicadas pela organização.")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Inscritos", len(regs))
-    c2.metric("Jogos", len(matches))
-    c3.metric("Finalizados/bye", len(finished))
-
-    tab1, tab2, tab3 = st.tabs(["Programação", "Chaves", "Inscritos"])
+    tab1, tab2 = st.tabs(["Programação diária", "Chaves publicadas"])
 
     with tab1:
-        df = schedule_df(tournament_id)
-        if df.empty:
-            st.info("Programação ainda não gerada.")
+        if not is_schedule_published(tournament):
+            st.info("A programação ainda não foi publicada pela organização.")
         else:
-            render_schedule_by_day(df)
+            df = schedule_df(tournament_id)
+            scheduled = df[df["Data"].astype(str).str.len() > 0] if not df.empty else df
 
-            pdf_bytes = schedule_pdf_bytes(tournament_id)
-            if pdf_bytes:
-                st.download_button(
-                    "Baixar programação completa em PDF",
-                    data=pdf_bytes,
-                    file_name=f"programacao_torneio_{tournament_id}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-
-    with tab2:
-        st.info("As chaves são separadas por categoria. A programação é geral do torneio inteiro.")
-
-        cats_with_brackets = categories_with_brackets(tournament_id)
-
-        if not cats_with_brackets:
-            st.info("Nenhuma chave foi gerada ainda.")
-        else:
-            view_mode = st.radio(
-                "Visualização",
-                ["Todas as categorias", "Uma categoria"],
-                horizontal=True,
-                key="public_bracket_view_mode",
-            )
-
-            if view_mode == "Todas as categorias":
-                for cat in cats_with_brackets:
-                    st.markdown(f"## {cat['name']}")
-                    render_bracket_visual(tournament_id, cat["id"])
-
-                    pdf_bytes = bracket_pdf_bytes(tournament_id, cat["id"])
-                    if pdf_bytes:
-                        st.download_button(
-                            f"Baixar chave em PDF — {cat['name']}",
-                            data=pdf_bytes,
-                            file_name=f"chave_{cat['name'].replace(' ', '_')}.pdf",
-                            mime="application/pdf",
-                            use_container_width=True,
-                            key=f"public_pdf_all_{cat['id']}",
-                        )
-
-                    with st.expander(f"Ver tabela detalhada — {cat['name']}", expanded=False):
-                        df = bracket_df(tournament_id, cat["id"])
-                        st.dataframe(df, use_container_width=True, hide_index=True)
+            if scheduled.empty:
+                st.info("A programação ainda não foi gerada.")
             else:
-                labels = {cat["name"]: cat["id"] for cat in cats_with_brackets}
-                selected = st.selectbox("Categoria", list(labels.keys()), key="public_single_bracket")
-                category_id = labels[selected]
+                today = today_sao_paulo()
+                today_df = scheduled[scheduled["Data"] == today]
 
-                st.markdown(f"## {selected}")
-                render_bracket_visual(tournament_id, category_id)
+                if not today_df.empty:
+                    st.markdown(f"## Programação de hoje — {weekday_pt(today)}")
+                    st.dataframe(
+                        today_df[
+                            [
+                                "Horário",
+                                "Quadra",
+                                "Categoria",
+                                "Fase",
+                                "Jogo",
+                                "Confronto",
+                            ]
+                        ].sort_values(["Horário", "Quadra"]),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.markdown("---")
 
-                pdf_bytes = bracket_pdf_bytes(tournament_id, category_id)
+                st.markdown("## Programação completa por dia")
+                public_df = scheduled[
+                    [
+                        "Data",
+                        "Horário",
+                        "Quadra",
+                        "Categoria",
+                        "Fase",
+                        "Jogo",
+                        "Confronto",
+                    ]
+                ].copy()
+                render_schedule_by_day(public_df, show_results=False)
+
+                pdf_bytes = public_schedule_pdf_bytes(tournament_id)
                 if pdf_bytes:
                     st.download_button(
-                        "Baixar chave em PDF",
+                        "Baixar programação em PDF",
                         data=pdf_bytes,
-                        file_name=f"chave_categoria_{category_id}.pdf",
+                        file_name=f"programacao_torneio_{tournament_id}.pdf",
                         mime="application/pdf",
                         use_container_width=True,
                     )
 
-                with st.expander("Ver tabela detalhada", expanded=False):
-                    df = bracket_df(tournament_id, category_id)
-                    st.dataframe(df, use_container_width=True, hide_index=True)
+    with tab2:
+        cats = public_categories_with_brackets(tournament_id)
 
-    with tab3:
-        rows = []
-        for reg in get_registrations(tournament_id):
-            p = reg.get("player") or {}
-            c = reg.get("category") or {}
-            rows.append(
-                {
-                    "Categoria": c.get("name", ""),
-                    "Atleta": p.get("name", ""),
-                    "Cidade": p.get("city", ""),
-                    "Origem": "Fora" if p.get("is_outside") else "Linhares",
-                }
-            )
-
-        df = pd.DataFrame(rows)
-        if df.empty:
-            st.info("Nenhum inscrito.")
+        if not cats:
+            st.info("As chaves ainda não foram publicadas pela organização.")
         else:
-            st.dataframe(df.sort_values(["Categoria", "Atleta"]), use_container_width=True, hide_index=True)
+            show_results = is_results_public(tournament)
+
+            for cat in cats:
+                st.markdown(f"## {cat['name']}")
+                render_bracket_visual(tournament_id, cat["id"], public_view=True, show_results=show_results)
+
+                pdf_bytes = bracket_pdf_bytes(
+                    tournament_id,
+                    cat["id"],
+                    public_view=True,
+                    show_results=show_results,
+                )
+                if pdf_bytes:
+                    st.download_button(
+                        f"Baixar chave em PDF — {cat['name']}",
+                        data=pdf_bytes,
+                        file_name=f"chave_{cat['name'].replace(' ', '_')}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                        key=f"public_pdf_v8_{cat['id']}",
+                    )
 
 
 # ============================================================
@@ -1857,6 +2087,8 @@ def admin_tournaments():
                         "start_date": start.isoformat(),
                         "end_date": end.isoformat(),
                         "active": True,
+                        "schedule_published": False,
+                        "results_public": False,
                     },
                 )
 
@@ -1867,11 +2099,50 @@ def admin_tournaments():
 
     df = pd.DataFrame(get_tournaments())
     if not df.empty:
+        visible_cols = [col for col in ["id", "name", "start_date", "end_date", "active", "schedule_published", "results_public"] if col in df.columns]
         st.dataframe(
-            df[["id", "name", "start_date", "end_date", "active"]],
+            df[visible_cols],
             use_container_width=True,
             hide_index=True,
         )
+
+    st.markdown("### Publicação da área pública")
+    tournament_id = tournament_selector("publication_tournament")
+    t = get_tournament(tournament_id)
+
+    col_pub1, col_pub2, col_pub3 = st.columns(3)
+
+    if is_schedule_published(t):
+        if col_pub1.button("Ocultar programação pública", use_container_width=True):
+            publish_schedule(tournament_id, False)
+            st.warning("Programação ocultada da área pública.")
+            st.rerun()
+    else:
+        if col_pub1.button("Publicar programação", use_container_width=True):
+            publish_schedule(tournament_id, True)
+            st.success("Programação publicada.")
+            st.rerun()
+
+    if is_results_public(t):
+        if col_pub2.button("Ocultar resultados", use_container_width=True):
+            publish_results(tournament_id, False)
+            st.warning("Resultados ocultados da área pública.")
+            st.rerun()
+    else:
+        if col_pub2.button("Publicar resultados", use_container_width=True):
+            publish_results(tournament_id, True)
+            st.success("Resultados publicados.")
+            st.rerun()
+
+    if col_pub3.button("Publicar todas as chaves geradas", use_container_width=True):
+        count = publish_all_brackets(tournament_id, True)
+        st.success(f"{count} chave(s) publicada(s).")
+        st.rerun()
+
+    if st.button("Ocultar todas as chaves da área pública", use_container_width=True):
+        count = publish_all_brackets(tournament_id, False)
+        st.warning(f"{count} chave(s) ocultada(s).")
+        st.rerun()
 
 
 def admin_categories(tournament_id):
@@ -2372,8 +2643,24 @@ def admin_brackets(tournament_id):
 
     df = bracket_df(tournament_id, category_id)
     if not df.empty:
-        st.markdown("#### Desenho da chave")
-        render_bracket_visual(tournament_id, category_id)
+        st.markdown("#### Desenho profissional da chave")
+        render_bracket_visual(tournament_id, category_id, public_view=False, show_results=True)
+
+        cat = get_category(category_id)
+        col_publish, col_hide = st.columns(2)
+
+        if not is_bracket_published(cat):
+            if col_publish.button("Publicar esta chave para os alunos", use_container_width=True):
+                publish_category_bracket(category_id, True)
+                st.success("Chave publicada na área pública.")
+                st.rerun()
+        else:
+            col_publish.success("Esta chave está publicada.")
+
+        if col_hide.button("Ocultar esta chave da área pública", use_container_width=True):
+            publish_category_bracket(category_id, False)
+            st.warning("Chave ocultada da área pública.")
+            st.rerun()
 
         with st.expander("Ver tabela detalhada da chave", expanded=False):
             st.dataframe(df, use_container_width=True, hide_index=True)
@@ -2389,7 +2676,7 @@ def admin_brackets(tournament_id):
             use_container_width=True,
         )
 
-        pdf_bytes = bracket_pdf_bytes(tournament_id, category_id)
+        pdf_bytes = bracket_pdf_bytes(tournament_id, category_id, public_view=False, show_results=True)
         if pdf_bytes:
             col_pdf.download_button(
                 "Exportar chave atual em PDF",

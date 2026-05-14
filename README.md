@@ -1,51 +1,27 @@
-# Tênis Linhares — Torneios V7 Fluxo Oficial
+# Tênis Linhares — Torneios V9 Revisão Final
 
-Versão de teste separada do app oficial.
+Versão revisada ponto a ponto após a V8.
 
-## Fluxo oficial da V7
+## Correções da V9
 
-### Chaves
-As chaves continuam separadas por categoria, como deve ser em torneio:
+- Corrigido risco de erro na área pública quando a programação estava sem colunas de resultado.
+- A área pública continua sem mostrar inscritos, quantidade de inscritos ou WhatsApp.
+- Programação pública usa a data de São Paulo/Brasil para destacar o dia correto.
+- A programação pública mostra somente: horário, quadra, categoria, fase, jogo e confronto.
+- Resultados só aparecem na chave se você publicar resultados.
+- Chaves públicas só aparecem quando publicadas.
+- Programação pública só aparece quando publicada.
+- Ao apagar programação, ela é ocultada automaticamente.
+- Chave visual segue em SVG com conectores reais e PDF em formato de chave.
 
-- 1ª Classe Masculina
-- 2ª Classe Masculina
-- 3ª Classe Masculina
-- Feminino
-- Iniciantes
-- Duplas
+## Mantido
 
-Agora existem duas formas:
-
-1. Gerar/importar chave por categoria.
-2. Sortear chaves de TODAS as categorias de uma vez.
-
-Cada categoria fica com sua chave própria.
-
-### Programação
-A programação é sempre geral do torneio inteiro.
-
-O app gera:
-
-- todas as categorias juntas;
-- todas as fases: oitavas, quartas, semifinais e finais;
-- semana inteira organizada por dia;
-- máximo de 3 jogos por horário;
-- 3 quadras;
-- 1h30 por rodada;
-- sem atleta em duas categorias no mesmo horário;
-- sem ultrapassar uma partida por quadra no mesmo horário.
-
-### Visual das chaves
-A área pública mostra as chaves em desenho visual por categoria.
-A tabela detalhada fica recolhida em um botão, para não parecer lista.
-
-### Mantido das versões anteriores
+- Programação geral da semana inteira.
+- Todas as categorias juntas.
+- Validação de conflito de quadra e atleta.
 - Importação inteligente de listas.
 - Importação de chave por PDF/TXT/CSV/imagem.
-- Exportar chave em PDF.
-- Exportar programação em PDF.
-- Validação de conflitos.
-- Motor rápido de programação.
+- Download de chave e programação em PDF.
 
 ## Render
 
@@ -61,8 +37,6 @@ Start Command:
 streamlit run app.py --server.port=$PORT --server.address=0.0.0.0
 ```
 
-Depois de atualizar no GitHub:
+## Supabase
 
-```text
-Manual Deploy > Clear build cache & deploy
-```
+Use o `supabase_schema.sql` desta versão e rode no SQL Editor se ainda não rodou a V8.

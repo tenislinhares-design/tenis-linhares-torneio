@@ -72,3 +72,12 @@ alter table public.tl_categories disable row level security;
 alter table public.tl_players disable row level security;
 alter table public.tl_registrations disable row level security;
 alter table public.tl_matches disable row level security;
+-- V8 — travas de publicação pública
+alter table public.tl_tournaments
+add column if not exists schedule_published boolean not null default false;
+
+alter table public.tl_tournaments
+add column if not exists results_public boolean not null default false;
+
+alter table public.tl_categories
+add column if not exists bracket_published boolean not null default false;

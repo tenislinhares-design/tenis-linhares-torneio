@@ -1,0 +1,22 @@
+ATUALIZAÇÃO V9 — REVISÃO FINAL
+==============================
+
+Substitua no GitHub:
+
+- app.py
+- requirements.txt
+- README.md
+- supabase_schema.sql
+
+Se você já rodou o SQL da V8, não precisa rodar de novo. Se não rodou, rode o `supabase_schema.sql` desta V9.
+
+Depois no Render:
+
+Manual Deploy > Clear build cache & deploy
+
+O que foi corrigido:
+
+- Área pública sem erro ao esconder resultados.
+- Data do dia usando horário do Brasil.
+- Programação pública sem placar/resultado quando resultados não estão publicados.
+- Chaves públicas continuam com desenho profissional e conectores reais.
