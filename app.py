@@ -1,6 +1,9 @@
 import os
 import math
 import random
+import re
+import io
+import csv
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -167,6 +170,296 @@ def get_player_by_whatsapp(whatsapp):
         return None
     rows = response_data(sb().table(T_PLAYERS).select("*").eq("whatsapp", whatsapp).execute())
     return first(rows)
+
+
+def normalize_name(name):
+    return re.sub(r"\s+", " ", str(name or "").strip()).lower()
+
+
+def get_all_players():
+    return response_data(sb().table(T_PLAYERS).select("*").execute())
+
+
+def get_player_by_name(name):
+    target = normalize_name(name)
+    if not target:
+        return None
+
+    for player in get_all_players():
+        if normalize_name(player.get("name")) == target:
+            return player
+
+    return None
+
+
+def clean_imported_name(line):
+    text = str(line or "").strip()
+    text = re.sub(r"^\s*[\-\*\•\d\.\)\(]+\s*", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    bad_words = [
+        "categoria", "chave", "quadra", "horário", "horario", "data",
+        "rodada", "jogo", "confronto", "vencedor", "semifinal", "final",
+        "oitavas", "quartas", "programação", "programacao"
+    ]
+
+    if not text:
+        return ""
+
+    lowered = text.lower()
+    if lowered in ["bye", "wo", "w.o", "w.o."]:
+        return "BYE"
+
+    if any(lowered == word for word in bad_words):
+        return ""
+
+    if len(text) <= 1:
+        return ""
+
+    return text
+
+
+def extract_text_from_uploaded_file(uploaded_file):
+    if not uploaded_file:
+        return ""
+
+    name = uploaded_file.name.lower()
+    raw = uploaded_file.read()
+
+    if name.endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(raw))
+            pages = []
+            for page in reader.pages:
+                pages.append(page.extract_text() or "")
+            return "\n".join(pages)
+        except Exception as exc:
+            st.error("Não consegui ler esse PDF automaticamente. Tente enviar TXT/CSV ou colar os nomes manualmente.")
+            st.code(str(exc))
+            return ""
+
+    try:
+        return raw.decode("utf-8")
+    except Exception:
+        try:
+            return raw.decode("latin-1")
+        except Exception:
+            return ""
+
+
+def extract_names_from_csv_text(text):
+    names = []
+    sample = text.strip()
+    if not sample:
+        return names
+
+    try:
+        reader = csv.DictReader(io.StringIO(sample))
+        if reader.fieldnames:
+            possible = ["nome", "name", "atleta", "jogador", "player"]
+            field = None
+            for f in reader.fieldnames:
+                if normalize_name(f) in possible:
+                    field = f
+                    break
+            if field:
+                for row in reader:
+                    nm = clean_imported_name(row.get(field, ""))
+                    if nm and nm.upper() != "BYE":
+                        names.append(nm)
+                return names
+    except Exception:
+        pass
+
+    return []
+
+
+def extract_names_from_free_text(text):
+    names = []
+    csv_names = extract_names_from_csv_text(text)
+    if csv_names:
+        return csv_names
+
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        # Se a linha é um confronto, pega os dois lados.
+        parts = re.split(r"\s+(?:x|X|vs|VS|v\.|V\.|×)\s+", line)
+        if len(parts) >= 2:
+            for part in parts[:2]:
+                nm = clean_imported_name(part)
+                if nm and nm.upper() != "BYE":
+                    names.append(nm)
+            continue
+
+        nm = clean_imported_name(line)
+        if nm and nm.upper() != "BYE":
+            names.append(nm)
+
+    seen = set()
+    unique = []
+    for name in names:
+        key = normalize_name(name)
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(name)
+
+    return unique
+
+
+def parse_external_bracket_lines(text):
+    """
+    Aceita:
+    João x Pedro
+    Carlos x BYE
+    Maria x Ana
+
+    Retorna lista de pares [(nome1, nome2), ...].
+    """
+    pairs = []
+
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        parts = re.split(r"\s+(?:x|X|vs|VS|v\.|V\.|×)\s+", line)
+        if len(parts) >= 2:
+            p1 = clean_imported_name(parts[0])
+            p2 = clean_imported_name(parts[1])
+            if p1 or p2:
+                pairs.append((p1 or "BYE", p2 or "BYE"))
+
+    return pairs
+
+
+def find_or_create_player_by_name_only(name, city="Linhares", is_outside=False, unavailable=""):
+    existing = get_player_by_name(name)
+    if existing:
+        # Atualiza dados básicos sem duplicar atleta.
+        update_row(
+            T_PLAYERS,
+            existing["id"],
+            {
+                "name": existing.get("name") or name.strip(),
+                "city": existing.get("city") or city.strip(),
+                "is_outside": bool(existing.get("is_outside") or is_outside),
+                "unavailable": existing.get("unavailable") or unavailable.strip(),
+            },
+        )
+        return existing["id"]
+
+    player = insert_row(
+        T_PLAYERS,
+        {
+            "name": name.strip(),
+            "whatsapp": "",
+            "city": city.strip(),
+            "is_outside": bool(is_outside),
+            "unavailable": unavailable.strip(),
+        },
+    )
+    return player["id"] if player else None
+
+
+def ensure_registration(tournament_id, category_id, player_id):
+    if registration_exists(tournament_id, category_id, player_id):
+        return False
+
+    cat = get_category(category_id)
+    current_count = len(get_registrations(tournament_id, category_id))
+
+    if current_count >= int(cat.get("max_players", 16)):
+        return None
+
+    insert_row(
+        T_REGISTRATIONS,
+        {
+            "tournament_id": tournament_id,
+            "category_id": category_id,
+            "player_id": player_id,
+        },
+    )
+    return True
+
+
+def generate_bracket_from_slots(tournament_id, category_id, slots):
+    """
+    Gera chave preservando posições e BYEs importados.
+    Exemplo slots:
+    [joao_id, pedro_id, carlos_id, None]
+    """
+    non_empty = [pid for pid in slots if pid]
+
+    if len(non_empty) < 2:
+        raise ValueError("Precisa de pelo menos 2 atletas para gerar a chave.")
+
+    size = max(2, next_power_two(len(slots)))
+    if size > 32:
+        raise ValueError("Este app teste suporta até 32 posições por categoria.")
+
+    slots = list(slots) + [None] * (size - len(slots))
+    names = round_names(size)
+    rounds = int(math.log2(size))
+
+    delete_matches_by_category(tournament_id, category_id)
+
+    previous_match_ids = []
+
+    for round_num in range(1, rounds + 1):
+        match_count = size // (2 ** round_num)
+        current_ids = []
+        round_name = names[round_num - 1]
+
+        for position in range(match_count):
+            if round_num == 1:
+                p1 = slots[position * 2]
+                p2 = slots[position * 2 + 1]
+                source1 = None
+                source2 = None
+                winner = None
+                status = "pendente"
+
+                if p1 and not p2:
+                    winner = p1
+                    status = "bye"
+                elif p2 and not p1:
+                    winner = p2
+                    status = "bye"
+            else:
+                p1 = None
+                p2 = None
+                source1 = previous_match_ids[position * 2]
+                source2 = previous_match_ids[position * 2 + 1]
+                winner = None
+                status = "pendente"
+
+            created = insert_row(
+                T_MATCHES,
+                {
+                    "tournament_id": tournament_id,
+                    "category_id": category_id,
+                    "round_num": round_num,
+                    "round_name": round_name,
+                    "position": position + 1,
+                    "player1_id": p1,
+                    "player2_id": p2,
+                    "source1_match_id": source1,
+                    "source2_match_id": source2,
+                    "winner_id": winner,
+                    "status": status,
+                },
+            )
+
+            if created:
+                current_ids.append(created["id"])
+
+        previous_match_ids = current_ids
+
+    refresh_bracket(tournament_id, category_id)
 
 
 # ============================================================
@@ -830,7 +1123,12 @@ def admin_categories(tournament_id):
 
 def find_or_create_player(name, whatsapp, city, is_outside, unavailable):
     whatsapp = whatsapp.strip()
+
     existing = get_player_by_whatsapp(whatsapp) if whatsapp else None
+
+    # Se não tiver WhatsApp, evita duplicar pelo nome.
+    if not existing and not whatsapp:
+        existing = get_player_by_name(name)
 
     if existing:
         update_row(
@@ -838,9 +1136,9 @@ def find_or_create_player(name, whatsapp, city, is_outside, unavailable):
             existing["id"],
             {
                 "name": name.strip(),
-                "city": city.strip(),
+                "city": city.strip() or existing.get("city"),
                 "is_outside": bool(is_outside),
-                "unavailable": unavailable.strip(),
+                "unavailable": unavailable.strip() or existing.get("unavailable"),
             },
         )
         return existing["id"]
@@ -942,6 +1240,162 @@ def admin_players(tournament_id):
     else:
         st.info("Nenhum atleta inscrito ainda.")
 
+    admin_import_players_tools(tournament_id)
+
+
+
+def admin_import_players_tools(tournament_id):
+    st.markdown("---")
+    st.subheader("Importações e backup de atletas")
+
+    cats = get_categories(tournament_id)
+    cat_map = {c["name"]: c["id"] for c in cats}
+
+    with st.expander("Importar lista de inscritos por texto, TXT, CSV ou PDF", expanded=False):
+        if not cat_map:
+            st.warning("Crie uma categoria antes de importar atletas.")
+        else:
+            target_category_name = st.selectbox("Categoria de destino", list(cat_map.keys()), key="bulk_target_category")
+            default_city = st.text_input("Cidade padrão", value="Linhares", key="bulk_city")
+            default_outside = st.checkbox("Marcar todos como atletas de fora", value=False, key="bulk_outside")
+            default_unavailable = st.text_area("Restrição padrão de horário", value="", key="bulk_unavailable")
+
+            uploaded = st.file_uploader(
+                "Subir lista em TXT, CSV ou PDF",
+                type=["txt", "csv", "pdf"],
+                key="bulk_file",
+            )
+
+            file_text = extract_text_from_uploaded_file(uploaded) if uploaded else ""
+
+            pasted = st.text_area(
+                "Ou cole os nomes aqui, um por linha",
+                value=file_text,
+                height=180,
+                key="bulk_pasted_names",
+                placeholder="João Silva\nPedro Santos\nCarlos Oliveira",
+            )
+
+            names = extract_names_from_free_text(pasted)
+
+            if names:
+                st.caption(f"{len(names)} nome(s) encontrado(s). Revise antes de importar.")
+                st.dataframe(pd.DataFrame({"Atleta": names}), use_container_width=True, hide_index=True)
+            else:
+                st.info("Cole uma lista ou envie um arquivo para visualizar os nomes.")
+
+            if st.button("Importar atletas para a categoria", key="bulk_import_button"):
+                category_id = cat_map[target_category_name]
+                saved = 0
+                repeated = 0
+                full = 0
+
+                for name in names:
+                    player_id = find_or_create_player_by_name_only(
+                        name,
+                        city=default_city,
+                        is_outside=default_outside,
+                        unavailable=default_unavailable,
+                    )
+                    result = ensure_registration(tournament_id, category_id, player_id)
+
+                    if result is True:
+                        saved += 1
+                    elif result is False:
+                        repeated += 1
+                    else:
+                        full += 1
+
+                if saved:
+                    st.success(f"{saved} atleta(s) importado(s).")
+                if repeated:
+                    st.warning(f"{repeated} atleta(s) já estavam inscritos.")
+                if full:
+                    st.error(f"{full} atleta(s) não entraram porque a categoria atingiu o limite.")
+                st.rerun()
+
+    with st.expander("Buscar atletas de torneios anteriores / backup", expanded=False):
+        tournaments = get_tournaments()
+        other_tournaments = [t for t in tournaments if t["id"] != tournament_id]
+
+        if not other_tournaments:
+            st.info("Ainda não existe outro torneio para copiar atletas.")
+        elif not cat_map:
+            st.warning("Crie uma categoria neste torneio antes de copiar atletas.")
+        else:
+            source_map = {
+                f'{t["name"]} • {t["start_date"]} a {t["end_date"]}': t["id"]
+                for t in other_tournaments
+            }
+            source_label = st.selectbox("Torneio de origem", list(source_map.keys()), key="backup_source_tournament")
+            source_id = source_map[source_label]
+
+            source_cats = get_categories(source_id)
+            source_cat_map = {"Todas as categorias": None}
+            source_cat_map.update({c["name"]: c["id"] for c in source_cats})
+
+            source_cat_label = st.selectbox("Categoria de origem", list(source_cat_map.keys()), key="backup_source_category")
+            source_cat_id = source_cat_map[source_cat_label]
+
+            target_cat_names = st.multiselect(
+                "Categoria(s) de destino neste torneio",
+                list(cat_map.keys()),
+                key="backup_target_categories",
+            )
+
+            source_regs = get_registrations(source_id, source_cat_id)
+
+            preview_rows = []
+            for reg in source_regs:
+                p = reg.get("player") or {}
+                c = reg.get("category") or {}
+                preview_rows.append(
+                    {
+                        "Categoria origem": c.get("name", ""),
+                        "Atleta": p.get("name", ""),
+                        "Cidade": p.get("city", ""),
+                        "Origem": "Fora" if p.get("is_outside") else "Linhares",
+                    }
+                )
+
+            if preview_rows:
+                st.caption(f"{len(preview_rows)} atleta(s) encontrado(s) no backup.")
+                st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+            else:
+                st.info("Nenhum atleta encontrado nessa seleção.")
+
+            if st.button("Copiar atletas selecionados para este torneio", key="copy_backup_button"):
+                if not target_cat_names:
+                    st.error("Escolha pelo menos uma categoria de destino.")
+                else:
+                    saved = 0
+                    repeated = 0
+                    full = 0
+
+                    for reg in source_regs:
+                        player = reg.get("player")
+                        if not player:
+                            continue
+
+                        for target_name in target_cat_names:
+                            target_category_id = cat_map[target_name]
+                            result = ensure_registration(tournament_id, target_category_id, player["id"])
+
+                            if result is True:
+                                saved += 1
+                            elif result is False:
+                                repeated += 1
+                            else:
+                                full += 1
+
+                    if saved:
+                        st.success(f"{saved} inscrição(ões) copiada(s) do backup.")
+                    if repeated:
+                        st.warning(f"{repeated} inscrição(ões) já existiam.")
+                    if full:
+                        st.error(f"{full} inscrição(ões) não entraram por limite de categoria.")
+                    st.rerun()
+
 
 def admin_brackets(tournament_id):
     st.subheader("Chaves")
@@ -1003,6 +1457,84 @@ def admin_brackets(tournament_id):
     df = bracket_df(tournament_id, category_id)
     if not df.empty:
         st.dataframe(df, use_container_width=True, hide_index=True)
+
+        csv_data = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Exportar chave atual em CSV",
+            data=csv_data,
+            file_name=f"chave_categoria_{category_id}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    st.markdown("---")
+    st.subheader("Importar chave pronta de fora")
+
+    with st.expander("Subir/colar chave já feita", expanded=False):
+        st.caption("Use um confronto por linha. Exemplo: João Silva x Pedro Santos. Também aceita BYE.")
+
+        uploaded_key = st.file_uploader(
+            "Subir chave em TXT, CSV ou PDF",
+            type=["txt", "csv", "pdf"],
+            key=f"external_bracket_file_{category_id}",
+        )
+
+        key_file_text = extract_text_from_uploaded_file(uploaded_key) if uploaded_key else ""
+
+        pasted_key = st.text_area(
+            "Ou cole a chave aqui",
+            value=key_file_text,
+            height=220,
+            key=f"external_bracket_text_{category_id}",
+            placeholder="João Silva x Pedro Santos\nCarlos Oliveira x BYE\nMarcos Lima x André Souza",
+        )
+
+        pairs = parse_external_bracket_lines(pasted_key)
+
+        if pairs:
+            preview = pd.DataFrame(
+                [{"Atleta 1": p1, "Atleta 2": p2} for p1, p2 in pairs]
+            )
+            st.caption(f"{len(pairs)} confronto(s) encontrado(s).")
+            st.dataframe(preview, use_container_width=True, hide_index=True)
+        else:
+            st.info("Cole confrontos no formato 'Atleta 1 x Atleta 2' para pré-visualizar.")
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            if st.button("Gerar chave importada", key=f"generate_external_bracket_{category_id}", use_container_width=True):
+                if not pairs:
+                    st.error("Nenhum confronto encontrado para importar.")
+                else:
+                    slots = []
+                    imported = 0
+
+                    for p1, p2 in pairs:
+                        for player_name in [p1, p2]:
+                            if normalize_name(player_name) in ["bye", "wo", "w.o", "w.o."]:
+                                slots.append(None)
+                                continue
+
+                            player_id = find_or_create_player_by_name_only(player_name, city="Linhares")
+                            ensure_registration(tournament_id, category_id, player_id)
+                            slots.append(player_id)
+                            imported += 1
+
+                    generate_bracket_from_slots(tournament_id, category_id, slots)
+                    st.success(f"Chave importada com {len(pairs)} confronto(s) e {imported} atleta(s).")
+                    st.rerun()
+
+        with col_b:
+            names_from_key = extract_names_from_free_text(pasted_key)
+            names_csv = pd.DataFrame({"Atleta": names_from_key}).to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Exportar nomes encontrados",
+                data=names_csv,
+                file_name=f"nomes_chave_categoria_{category_id}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
 
 def admin_schedule(tournament_id):
