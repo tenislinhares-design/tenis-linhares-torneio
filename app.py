@@ -97,6 +97,21 @@ def update_row(table, row_id, payload):
     return execute_query(sb().table(table).update(payload).eq("id", row_id))
 
 
+def update_matches_schedule_bulk(schedule_payloads):
+    """
+    Atualiza a programação em lote.
+    Isso evita centenas de chamadas individuais ao Supabase.
+    """
+    if not schedule_payloads:
+        return None
+
+    return execute_query(
+        sb()
+        .table(T_MATCHES)
+        .upsert(schedule_payloads, on_conflict="id")
+    )
+
+
 def delete_matches_by_category(tournament_id, category_id):
     return execute_query(
         sb()
@@ -254,10 +269,33 @@ def extract_text_from_uploaded_file(uploaded_file):
             pages = []
             for page in reader.pages:
                 pages.append(page.extract_text() or "")
-            return "\n".join(pages)
+            text = "\n".join(pages).strip()
+            if not text:
+                st.warning(
+                    "O PDF foi enviado, mas parece ser imagem/scan sem texto selecionável. "
+                    "Cole os nomes/confrontos no campo abaixo ou envie TXT/CSV."
+                )
+            return text
         except Exception as exc:
             st.error("Não consegui ler esse PDF automaticamente. Tente enviar TXT/CSV ou colar os nomes manualmente.")
             st.code(str(exc))
+            return ""
+
+    if name.endswith((".png", ".jpg", ".jpeg", ".webp")):
+        try:
+            from PIL import Image
+            import pytesseract
+
+            image = Image.open(io.BytesIO(raw))
+            text = pytesseract.image_to_string(image, lang="por+eng").strip()
+            if not text:
+                st.warning("A imagem foi enviada, mas não consegui extrair texto. Cole os nomes/confrontos no campo abaixo.")
+            return text
+        except Exception as exc:
+            st.warning(
+                "Recebi a imagem, mas o OCR não está disponível neste servidor ou não conseguiu ler. "
+                "Para funcionar 100%, prefira PDF com texto, TXT/CSV, ou cole a chave no campo abaixo."
+            )
             return ""
 
     try:
@@ -978,6 +1016,51 @@ def generate_bracket(tournament_id, category_id, ordered_player_ids):
     refresh_bracket(tournament_id, category_id)
 
 
+
+def generate_all_brackets_random(tournament_id):
+    """
+    Gera chaves por categoria, mas em ação única.
+    Cada categoria continua com sua própria chave.
+    """
+    categories = get_categories(tournament_id)
+    created = 0
+    skipped = []
+
+    for cat in categories:
+        players = registered_players(tournament_id, cat["id"])
+        if len(players) < 2:
+            skipped.append(f'{cat["name"]}: menos de 2 atletas')
+            continue
+
+        player_ids = [p["id"] for p in players]
+        random.shuffle(player_ids)
+        generate_bracket(tournament_id, cat["id"], player_ids)
+        created += 1
+
+    return created, skipped
+
+
+def refresh_all_brackets(tournament_id):
+    categories = get_categories(tournament_id)
+    updated = 0
+
+    for cat in categories:
+        if get_matches(tournament_id, cat["id"]):
+            refresh_bracket(tournament_id, cat["id"])
+            updated += 1
+
+    return updated
+
+
+def categories_with_brackets(tournament_id):
+    result = []
+    for cat in get_categories(tournament_id):
+        matches = get_matches(tournament_id, cat["id"])
+        if matches:
+            result.append(cat)
+    return result
+
+
 def refresh_bracket(tournament_id, category_id):
     matches = get_matches(tournament_id, category_id)
     winners = {m["id"]: m.get("winner_id") for m in matches}
@@ -1073,19 +1156,57 @@ def build_slots(start_date, end_date, include_weekend=True):
 
 
 def clear_schedule(tournament_id):
-    for match in get_matches(tournament_id):
-        update_row(
-            T_MATCHES,
-            match["id"],
+    execute_query(
+        sb()
+        .table(T_MATCHES)
+        .update(
             {
                 "scheduled_date": None,
                 "scheduled_time": None,
                 "court": None,
-            },
+            }
         )
+        .eq("tournament_id", tournament_id)
+    )
+
+
+def possible_players_for_match_local(match, matches_by_id, cache):
+    """
+    Retorna todos os atletas que podem aparecer neste jogo,
+    usando apenas dados já carregados na memória.
+    """
+    match_id = match.get("id")
+    if match_id in cache:
+        return cache[match_id]
+
+    players = set()
+
+    if match.get("player1_id"):
+        players.add(match["player1_id"])
+    if match.get("player2_id"):
+        players.add(match["player2_id"])
+
+    for source_id in [match.get("source1_match_id"), match.get("source2_match_id")]:
+        if source_id and source_id in matches_by_id:
+            players.update(possible_players_for_match_local(matches_by_id[source_id], matches_by_id, cache))
+
+    cache[match_id] = players
+    return players
+
+
+def get_all_players_map():
+    players = get_all_players()
+    return {p["id"]: p for p in players}
 
 
 def generate_schedule(tournament_id, include_weekend=True):
+    """
+    Geração rápida:
+    - carrega torneio, jogos e atletas uma vez;
+    - calcula tudo na memória;
+    - grava a programação em lote no Supabase;
+    - valida conflito de quadra e de atleta possível.
+    """
     tournament = get_tournament(tournament_id)
     if not tournament:
         raise ValueError("Torneio não encontrado.")
@@ -1094,16 +1215,33 @@ def generate_schedule(tournament_id, include_weekend=True):
 
     slots = build_slots(tournament["start_date"], tournament["end_date"], include_weekend)
     matches = get_matches(tournament_id)
+    players_by_id = get_all_players_map()
+
+    if not matches:
+        return 0, 0
+
+    matches_by_id = {m["id"]: m for m in matches}
+    possible_cache = {}
 
     used_slots = set()
     player_busy = set()
     match_datetime = {}
     pending = []
+    updates = []
+
+    def match_has_outside_fast(match):
+        possible_players = possible_players_for_match_local(match, matches_by_id, possible_cache)
+        for player_id in possible_players:
+            player = players_by_id.get(player_id)
+            if player and player.get("is_outside"):
+                return True
+        return False
 
     def slot_score(slot, match):
         score = slot["dt"].timestamp()
 
-        if has_outside_player(match):
+        # Jogador de fora prioriza sexta/fim de semana.
+        if match_has_outside_fast(match):
             if slot["weekday"] == 4:
                 score -= 10_000_000
             elif slot["weekday"] in [5, 6]:
@@ -1111,25 +1249,42 @@ def generate_schedule(tournament_id, include_weekend=True):
 
         return score
 
+    # Rodada por rodada, mas misturando categorias para evitar sobreposição geral.
     matches = sorted(
         matches,
         key=lambda m: (m.get("round_num", 1), m.get("category_id", 0), m.get("position", 0)),
     )
 
+    sorted_slots_cache = {}
+
     for match in matches:
         assigned = False
-        players = match_players(match)
+        possible_players = possible_players_for_match_local(match, matches_by_id, possible_cache)
 
-        for slot in sorted(slots, key=lambda s: slot_score(s, match)):
+        # Cacheia ordenação de slots por tipo de prioridade.
+        outside_key = "outside" if match_has_outside_fast(match) else "normal"
+        if outside_key not in sorted_slots_cache:
+            sorted_slots_cache[outside_key] = sorted(
+                slots,
+                key=lambda s: (
+                    s["dt"].timestamp()
+                    - (10_000_000 if outside_key == "outside" and s["weekday"] == 4 else 0)
+                    - (9_000_000 if outside_key == "outside" and s["weekday"] in [5, 6] else 0)
+                ),
+            )
+
+        for slot in sorted_slots_cache[outside_key]:
             slot_key = (slot["date"], slot["time"], slot["court"])
 
             if slot_key in used_slots:
                 continue
 
-            conflict = any((pid, slot["date"], slot["time"]) in player_busy for pid in players)
-            if conflict:
+            # Impede mesmo atleta possível no mesmo dia/horário,
+            # mesmo se ele ainda estiver como "vencedor do jogo".
+            if any((pid, slot["date"], slot["time"]) in player_busy for pid in possible_players):
                 continue
 
+            # Não agenda próxima fase antes da fase anterior.
             too_early = False
             for source_id in [match.get("source1_match_id"), match.get("source2_match_id")]:
                 if source_id and source_id in match_datetime:
@@ -1140,21 +1295,32 @@ def generate_schedule(tournament_id, include_weekend=True):
             if too_early:
                 continue
 
-            update_row(
-                T_MATCHES,
-                match["id"],
-                {
-                    "scheduled_date": slot["date"],
-                    "scheduled_time": slot["time"],
-                    "court": slot["court"],
-                },
-            )
-
             used_slots.add(slot_key)
             match_datetime[match["id"]] = slot["dt"]
 
-            for player_id in players:
+            for player_id in possible_players:
                 player_busy.add((player_id, slot["date"], slot["time"]))
+
+            updates.append(
+                {
+                    "id": match["id"],
+                    "tournament_id": tournament_id,
+                    "category_id": match["category_id"],
+                    "round_num": match["round_num"],
+                    "round_name": match["round_name"],
+                    "position": match["position"],
+                    "player1_id": match.get("player1_id"),
+                    "player2_id": match.get("player2_id"),
+                    "source1_match_id": match.get("source1_match_id"),
+                    "source2_match_id": match.get("source2_match_id"),
+                    "winner_id": match.get("winner_id"),
+                    "score": match.get("score"),
+                    "status": match.get("status"),
+                    "scheduled_date": slot["date"],
+                    "scheduled_time": slot["time"],
+                    "court": slot["court"],
+                }
+            )
 
             assigned = True
             break
@@ -1162,7 +1328,50 @@ def generate_schedule(tournament_id, include_weekend=True):
         if not assigned:
             pending.append(match["id"])
 
-    return len(matches) - len(pending), len(pending)
+    update_matches_schedule_bulk(updates)
+
+    return len(updates), len(pending)
+
+
+def schedule_conflict_report(tournament_id):
+    matches = get_matches(tournament_id)
+    matches_by_id = {m["id"]: m for m in matches}
+    possible_cache = {}
+    players_by_id = get_all_players_map()
+
+    slot_usage = {}
+    player_time_usage = {}
+    errors = []
+
+    def local_player_label(player_id):
+        p = players_by_id.get(player_id)
+        return p.get("name", f"Atleta {player_id}") if p else f"Atleta {player_id}"
+
+    for match in matches:
+        if not match.get("scheduled_date") or not match.get("scheduled_time"):
+            continue
+
+        slot_key = (match["scheduled_date"], match["scheduled_time"], match.get("court"))
+        slot_usage.setdefault(slot_key, []).append(match["id"])
+
+        possible_players = possible_players_for_match_local(match, matches_by_id, possible_cache)
+        for player_id in possible_players:
+            time_key = (player_id, match["scheduled_date"], match["scheduled_time"])
+            player_time_usage.setdefault(time_key, []).append(match["id"])
+
+    for slot_key, match_ids in slot_usage.items():
+        if len(match_ids) > 1:
+            errors.append(
+                f"Conflito de quadra: {slot_key[0]} {slot_key[1]} quadra {slot_key[2]} nos jogos {match_ids}"
+            )
+
+    for (player_id, day, hour), match_ids in player_time_usage.items():
+        if len(match_ids) > 1:
+            errors.append(
+                f"Possível conflito de atleta: {local_player_label(player_id)} em {day} às {hour}, jogos {match_ids}"
+            )
+
+    return errors
 
 
 # ============================================================
@@ -1196,6 +1405,61 @@ def schedule_df(tournament_id):
     return df
 
 
+def weekday_pt(date_text):
+    try:
+        d = datetime.strptime(date_text, "%Y-%m-%d").date()
+    except Exception:
+        return "Sem data"
+
+    names = {
+        0: "Segunda-feira",
+        1: "Terça-feira",
+        2: "Quarta-feira",
+        3: "Quinta-feira",
+        4: "Sexta-feira",
+        5: "Sábado",
+        6: "Domingo",
+    }
+    return names.get(d.weekday(), "")
+
+
+def render_schedule_by_day(df):
+    if df.empty:
+        st.info("Programação ainda não gerada.")
+        return
+
+    scheduled = df[df["Data"].astype(str).str.len() > 0].copy()
+    unscheduled = df[df["Data"].astype(str).str.len() == 0].copy()
+
+    if scheduled.empty:
+        st.info("Ainda não há jogos com data/horário.")
+    else:
+        for day in sorted(scheduled["Data"].unique()):
+            day_df = scheduled[scheduled["Data"] == day].sort_values(["Horário", "Quadra"])
+            st.markdown(f"### {weekday_pt(day)} — {day}")
+            st.dataframe(
+                day_df[
+                    [
+                        "Horário",
+                        "Quadra",
+                        "Categoria",
+                        "Fase",
+                        "Jogo",
+                        "Confronto",
+                        "Placar",
+                        "Vencedor",
+                        "Status",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    if not unscheduled.empty:
+        with st.expander("Jogos sem horário", expanded=False):
+            st.dataframe(unscheduled, use_container_width=True, hide_index=True)
+
+
 def bracket_df(tournament_id, category_id):
     rows = []
 
@@ -1215,6 +1479,188 @@ def bracket_df(tournament_id, category_id):
         )
 
     return pd.DataFrame(rows)
+
+
+def render_bracket_visual(tournament_id, category_id):
+    matches = get_matches(tournament_id, category_id)
+    if not matches:
+        st.info("Chave ainda não gerada.")
+        return
+
+    rounds = {}
+    for match in matches:
+        rounds.setdefault(match.get("round_num", 1), []).append(match)
+
+    st.markdown(
+        """
+        <style>
+        .tl-bracket-wrap {
+            overflow-x: auto;
+            padding-bottom: 14px;
+        }
+        .tl-bracket {
+            display: flex;
+            gap: 22px;
+            align-items: stretch;
+            min-width: 900px;
+        }
+        .tl-round {
+            min-width: 240px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-around;
+            gap: 14px;
+        }
+        .tl-round-title {
+            color: #CCFF00;
+            font-weight: 900;
+            margin-bottom: 8px;
+            text-align: center;
+            border-bottom: 1px solid rgba(204,255,0,.25);
+            padding-bottom: 6px;
+        }
+        .tl-match-box {
+            position: relative;
+            background: rgba(21,28,24,.96);
+            border: 1px solid rgba(204,255,0,.30);
+            border-radius: 14px;
+            padding: 10px;
+            box-shadow: 0 8px 18px rgba(0,0,0,.22);
+        }
+        .tl-match-box:after {
+            content: "";
+            position: absolute;
+            right: -14px;
+            top: 50%;
+            width: 14px;
+            border-top: 1px solid rgba(204,255,0,.35);
+        }
+        .tl-player-row {
+            display: flex;
+            justify-content: space-between;
+            border-bottom: 1px solid rgba(255,255,255,.08);
+            padding: 4px 0;
+            color: #f5fff2;
+            font-size: 13px;
+        }
+        .tl-player-row:last-child {
+            border-bottom: none;
+        }
+        .tl-match-meta {
+            color: #b8c7b8;
+            font-size: 11px;
+            margin-top: 5px;
+        }
+        .tl-winner {
+            color: #CCFF00;
+            font-weight: 800;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    html = ['<div class="tl-bracket-wrap"><div class="tl-bracket">']
+
+    for round_num in sorted(rounds):
+        round_matches = sorted(rounds[round_num], key=lambda m: m.get("position", 0))
+        round_title = round_matches[0].get("round_name", f"Rodada {round_num}") if round_matches else f"Rodada {round_num}"
+        html.append('<div class="tl-round">')
+        html.append(f'<div class="tl-round-title">{round_title}</div>')
+
+        for match in round_matches:
+            p1 = player_label(match.get("player1_id"))
+            p2 = player_label(match.get("player2_id"))
+
+            if not match.get("player1_id") and match.get("source1_match_id"):
+                p1 = f'Vencedor Jogo {match["source1_match_id"]}'
+            if not match.get("player2_id") and match.get("source2_match_id"):
+                p2 = f'Vencedor Jogo {match["source2_match_id"]}'
+
+            winner = player_label(match.get("winner_id")) if match.get("winner_id") else ""
+            score = match.get("score") or ""
+
+            p1_class = "tl-player-row tl-winner" if match.get("winner_id") and match.get("winner_id") == match.get("player1_id") else "tl-player-row"
+            p2_class = "tl-player-row tl-winner" if match.get("winner_id") and match.get("winner_id") == match.get("player2_id") else "tl-player-row"
+
+            html.append('<div class="tl-match-box">')
+            html.append(f'<div class="{p1_class}"><span>{p1}</span><span>{score if winner == p1 else ""}</span></div>')
+            html.append(f'<div class="{p2_class}"><span>{p2}</span><span>{score if winner == p2 else ""}</span></div>')
+            meta = f'Jogo {match["id"]}'
+            if match.get("scheduled_date"):
+                meta += f' - {match["scheduled_date"]} {match.get("scheduled_time","")} Q{match.get("court","")}'
+            html.append(f'<div class="tl-match-meta">{meta}</div>')
+            html.append('</div>')
+
+        html.append('</div>')
+
+    html.append("</div></div>")
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+
+def build_pdf_table(title, rows, columns, filename_hint="documento"):
+    buffer = io.BytesIO()
+
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    except Exception as exc:
+        st.error("Biblioteca de PDF não instalada. Confira se 'reportlab' está no requirements.txt.")
+        st.code(str(exc))
+        return b""
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(A4),
+        rightMargin=22,
+        leftMargin=22,
+        topMargin=22,
+        bottomMargin=22,
+    )
+    styles = getSampleStyleSheet()
+    elements = [Paragraph(title, styles["Title"]), Spacer(1, 10)]
+
+    data = [columns]
+    for row in rows:
+        data.append([str(row.get(col, "")) for col in columns])
+
+    table = Table(data, repeatRows=1)
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1b301f")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#CCFF00")),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f3f3f3")]),
+            ]
+        )
+    )
+    elements.append(table)
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def bracket_pdf_bytes(tournament_id, category_id):
+    tournament = get_tournament(tournament_id)
+    category = get_category(category_id)
+    rows = bracket_df(tournament_id, category_id).to_dict("records")
+    columns = ["Fase", "Jogo", "Confronto", "Data", "Horário", "Quadra", "Placar", "Vencedor", "Status"]
+    title = f'{tournament.get("name", "Torneio")} - {category.get("name", "Categoria")} - Chave'
+    return build_pdf_table(title, rows, columns)
+
+
+def schedule_pdf_bytes(tournament_id):
+    tournament = get_tournament(tournament_id)
+    rows = schedule_df(tournament_id).to_dict("records")
+    columns = ["Data", "Horário", "Quadra", "Categoria", "Fase", "Jogo", "Confronto", "Placar", "Vencedor", "Status"]
+    title = f'{tournament.get("name", "Torneio")} - Programação Completa'
+    return build_pdf_table(title, rows, columns)
 
 
 # ============================================================
@@ -1277,16 +1723,73 @@ def public_page():
         if df.empty:
             st.info("Programação ainda não gerada.")
         else:
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            render_schedule_by_day(df)
+
+            pdf_bytes = schedule_pdf_bytes(tournament_id)
+            if pdf_bytes:
+                st.download_button(
+                    "Baixar programação completa em PDF",
+                    data=pdf_bytes,
+                    file_name=f"programacao_torneio_{tournament_id}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
 
     with tab2:
-        category_id = category_selector(tournament_id, "public_category")
-        if category_id:
-            df = bracket_df(tournament_id, category_id)
-            if df.empty:
-                st.info("Chave ainda não gerada para esta categoria.")
+        st.info("As chaves são separadas por categoria. A programação é geral do torneio inteiro.")
+
+        cats_with_brackets = categories_with_brackets(tournament_id)
+
+        if not cats_with_brackets:
+            st.info("Nenhuma chave foi gerada ainda.")
+        else:
+            view_mode = st.radio(
+                "Visualização",
+                ["Todas as categorias", "Uma categoria"],
+                horizontal=True,
+                key="public_bracket_view_mode",
+            )
+
+            if view_mode == "Todas as categorias":
+                for cat in cats_with_brackets:
+                    st.markdown(f"## {cat['name']}")
+                    render_bracket_visual(tournament_id, cat["id"])
+
+                    pdf_bytes = bracket_pdf_bytes(tournament_id, cat["id"])
+                    if pdf_bytes:
+                        st.download_button(
+                            f"Baixar chave em PDF — {cat['name']}",
+                            data=pdf_bytes,
+                            file_name=f"chave_{cat['name'].replace(' ', '_')}.pdf",
+                            mime="application/pdf",
+                            use_container_width=True,
+                            key=f"public_pdf_all_{cat['id']}",
+                        )
+
+                    with st.expander(f"Ver tabela detalhada — {cat['name']}", expanded=False):
+                        df = bracket_df(tournament_id, cat["id"])
+                        st.dataframe(df, use_container_width=True, hide_index=True)
             else:
-                st.dataframe(df, use_container_width=True, hide_index=True)
+                labels = {cat["name"]: cat["id"] for cat in cats_with_brackets}
+                selected = st.selectbox("Categoria", list(labels.keys()), key="public_single_bracket")
+                category_id = labels[selected]
+
+                st.markdown(f"## {selected}")
+                render_bracket_visual(tournament_id, category_id)
+
+                pdf_bytes = bracket_pdf_bytes(tournament_id, category_id)
+                if pdf_bytes:
+                    st.download_button(
+                        "Baixar chave em PDF",
+                        data=pdf_bytes,
+                        file_name=f"chave_categoria_{category_id}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+
+                with st.expander("Ver tabela detalhada", expanded=False):
+                    df = bracket_df(tournament_id, category_id)
+                    st.dataframe(df, use_container_width=True, hide_index=True)
 
     with tab3:
         rows = []
@@ -1567,7 +2070,7 @@ def admin_import_players_tools(tournament_id):
 
         uploaded_mixed = st.file_uploader(
             "Subir lista única em TXT, CSV ou PDF",
-            type=["txt", "csv", "pdf"],
+            type=["txt", "csv", "pdf", "png", "jpg", "jpeg", "webp"],
             key="mixed_import_file",
         )
         mixed_file_text = extract_text_from_uploaded_file(uploaded_mixed) if uploaded_mixed else ""
@@ -1639,7 +2142,7 @@ def admin_import_players_tools(tournament_id):
 
             uploaded = st.file_uploader(
                 "Subir lista em TXT, CSV ou PDF",
-                type=["txt", "csv", "pdf"],
+                type=["txt", "csv", "pdf", "png", "jpg", "jpeg", "webp"],
                 key="bulk_file",
             )
 
@@ -1776,6 +2279,42 @@ def admin_import_players_tools(tournament_id):
 
 def admin_brackets(tournament_id):
     st.subheader("Chaves")
+    st.info(
+        "Fluxo oficial: cada categoria tem sua própria chave. "
+        "Você pode gerar/importar por categoria ou gerar todas as chaves de uma vez. "
+        "A programação é sempre geral do torneio inteiro."
+    )
+
+    st.markdown("### Ações gerais de todas as categorias")
+
+    col_all_1, col_all_2 = st.columns(2)
+
+    if col_all_1.button("Sortear chaves de TODAS as categorias", use_container_width=True):
+        created, skipped = generate_all_brackets_random(tournament_id)
+        if created:
+            st.success(f"{created} chave(s) gerada(s), uma para cada categoria com atletas suficientes.")
+        if skipped:
+            with st.expander("Categorias ignoradas", expanded=False):
+                for item in skipped:
+                    st.write("• " + item)
+        st.rerun()
+
+    if col_all_2.button("Atualizar avanço de TODAS as chaves", use_container_width=True):
+        updated = refresh_all_brackets(tournament_id)
+        st.success(f"{updated} chave(s) atualizada(s).")
+        st.rerun()
+
+    with st.expander("Ver desenho de todas as chaves já geradas", expanded=False):
+        cats_with_brackets = categories_with_brackets(tournament_id)
+        if not cats_with_brackets:
+            st.info("Nenhuma chave gerada ainda.")
+        else:
+            for cat in cats_with_brackets:
+                st.markdown(f"## {cat['name']}")
+                render_bracket_visual(tournament_id, cat["id"])
+
+    st.markdown("---")
+    st.markdown("### Trabalhar em uma categoria específica")
 
     category_id = category_selector(tournament_id, "admin_bracket_cat")
     if not category_id:
@@ -1833,10 +2372,16 @@ def admin_brackets(tournament_id):
 
     df = bracket_df(tournament_id, category_id)
     if not df.empty:
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.markdown("#### Desenho da chave")
+        render_bracket_visual(tournament_id, category_id)
+
+        with st.expander("Ver tabela detalhada da chave", expanded=False):
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+        col_csv, col_pdf = st.columns(2)
 
         csv_data = df.to_csv(index=False).encode("utf-8")
-        st.download_button(
+        col_csv.download_button(
             "Exportar chave atual em CSV",
             data=csv_data,
             file_name=f"chave_categoria_{category_id}.csv",
@@ -1844,15 +2389,25 @@ def admin_brackets(tournament_id):
             use_container_width=True,
         )
 
+        pdf_bytes = bracket_pdf_bytes(tournament_id, category_id)
+        if pdf_bytes:
+            col_pdf.download_button(
+                "Exportar chave atual em PDF",
+                data=pdf_bytes,
+                file_name=f"chave_categoria_{category_id}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+
     st.markdown("---")
     st.subheader("Importar chave pronta de fora")
 
     with st.expander("Subir/colar chave já feita", expanded=False):
-        st.caption("Use um confronto por linha. Exemplo: João Silva x Pedro Santos. Também aceita BYE.")
+        st.caption("Use um confronto por linha. Exemplo: João Silva x Pedro Santos. Também aceita BYE. Aceita PDF/TXT/CSV e tenta ler imagem quando o servidor tiver OCR.")
 
         uploaded_key = st.file_uploader(
-            "Subir chave em TXT, CSV ou PDF",
-            type=["txt", "csv", "pdf"],
+            "Subir chave em PDF, imagem, TXT ou CSV",
+            type=["txt", "csv", "pdf", "png", "jpg", "jpeg", "webp"],
             key=f"external_bracket_file_{category_id}",
         )
 
@@ -1922,19 +2477,30 @@ def admin_brackets(tournament_id):
 def admin_schedule(tournament_id):
     st.subheader("Programação automática")
     st.info(
-        "Regra: 3 quadras, jogos de 1h30, seg-qui 16:00/17:30/19:00/20:30, sexta 15:30/17:00/18:30/20:00/21:30."
+        "Regra oficial: a programação é GERAL do torneio inteiro, não por categoria. Usa todas as categorias, quartas/semis/finais, 3 quadras por horário e jogos de 1h30. "
+        "O motor carrega os dados uma vez, calcula tudo na memória, evita cruzamento de atleta entre categorias e entrega a semana organizada por dia."
     )
 
     include_weekend = st.checkbox("Incluir sábado e domingo", value=True)
 
     col1, col2 = st.columns(2)
 
-    if col1.button("Gerar programação automática", use_container_width=True):
+    if col1.button("Gerar programação geral da semana inteira", use_container_width=True):
         scheduled, pending = generate_schedule(tournament_id, include_weekend)
+        conflicts = schedule_conflict_report(tournament_id)
+
         if pending:
             st.warning(f"{scheduled} jogos agendados e {pending} ficaram sem horário.")
         else:
             st.success(f"{scheduled} jogos agendados.")
+
+        if conflicts:
+            st.error("Atenção: o validador encontrou possíveis conflitos.")
+            for item in conflicts[:30]:
+                st.write("• " + item)
+        else:
+            st.success("Validação concluída: nenhum conflito de horário encontrado.")
+
         st.rerun()
 
     if col2.button("Limpar programação", use_container_width=True):
@@ -1944,7 +2510,29 @@ def admin_schedule(tournament_id):
 
     df = schedule_df(tournament_id)
     if not df.empty:
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.markdown("### Programação organizada por dia")
+        render_schedule_by_day(df)
+
+        col_pdf, col_check = st.columns(2)
+
+        pdf_bytes = schedule_pdf_bytes(tournament_id)
+        if pdf_bytes:
+            col_pdf.download_button(
+                "Exportar programação completa em PDF",
+                data=pdf_bytes,
+                file_name=f"programacao_torneio_{tournament_id}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+
+        if col_check.button("Validar conflitos agora", use_container_width=True):
+            conflicts = schedule_conflict_report(tournament_id)
+            if conflicts:
+                st.error("Conflitos encontrados:")
+                for item in conflicts:
+                    st.write("• " + item)
+            else:
+                st.success("Nenhum conflito de horário encontrado.")
 
     st.markdown("#### Editar jogo manualmente")
 

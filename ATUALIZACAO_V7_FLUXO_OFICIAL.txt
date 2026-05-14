@@ -1,0 +1,31 @@
+ATUALIZAÇÃO V7 — FLUXO OFICIAL
+==============================
+
+Substitua no GitHub:
+
+- app.py
+- requirements.txt
+- README.md
+
+Não precisa alterar o Supabase se você já rodou o SQL.
+
+Depois no Render:
+
+1. Manual Deploy
+2. Clear build cache & deploy
+
+O que testar:
+
+1. Admin > Chaves
+   - Clique em "Sortear chaves de TODAS as categorias".
+   - Ou trabalhe uma categoria específica.
+   - Veja o desenho das chaves, não apenas a tabela.
+
+2. Admin > Programação
+   - Clique em "Gerar programação geral da semana inteira".
+   - O app deve gerar todas as categorias juntas.
+   - Depois clique em "Validar conflitos agora".
+
+3. Área pública
+   - Chaves aparecem por categoria no formato visual.
+   - Programação aparece separada por dia.
